@@ -5,13 +5,19 @@ import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import type { Client, ClientChannel } from 'ssh2';
-import type { ConnectionLease, TerminalIdentity } from '../src/core/types.js';
+import type { ConnectionLease, InputAction, TerminalIdentity, TerminalTarget } from '../src/core/types.js';
 import { LiteSshError } from '../src/core/errors.js';
 import { ReadableRecorder } from '../src/cache/recorder.js';
 import { encodeMarkerOsc } from '../src/shell/protocol.js';
 import { TerminalSession } from '../src/terminal/session.js';
 import { createApplication } from '../src/app.js';
 import { startMockSsh } from './helpers/mock-ssh.js';
+import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createMcpServer } from '../src/mcp/server.js';
+import type { ConfigStore } from '../src/config/store.js';
+import type { ConnectionPool } from '../src/ssh/pool.js';
+import type { TerminalService } from '../src/terminal/service.js';
 
 class RejectingProbeChannel extends PassThrough {
   readonly stderr = new PassThrough();
@@ -82,6 +88,7 @@ interface FlushGate {
   failWrites(): void;
   contents(): string;
   readonly handleClosed: boolean;
+  readonly hasBlockedWrite: boolean;
 }
 
 async function gatedRecorder(identity: TerminalIdentity, path: string): Promise<FlushGate> {
@@ -89,13 +96,14 @@ async function gatedRecorder(identity: TerminalIdentity, path: string): Promise<
   let unblock: (() => void) | undefined;
   let failed = false;
   let closed = false;
+  let entered = false;
   const written: string[] = [];
   // This isolated fixture supplies an exact owned deletion target; the fake
   // handle records parsed cache bytes in memory and never touches user files.
   await fs.writeFile(path, '', { flag: 'wx' });
   const handle = {
     write: async (buffer: Buffer, offset: number, length: number) => {
-      if (gate) await gate;
+      if (gate) { entered = true; await gate; }
       if (failed) throw Object.assign(new Error('fixture write failure'), { code: 'EIO' });
       written.push(buffer.subarray(offset, offset + length).toString('utf8'));
       return { bytesWritten: length, buffer };
@@ -105,11 +113,12 @@ async function gatedRecorder(identity: TerminalIdentity, path: string): Promise<
   const recorder = await ReadableRecorder.createWithHandle(handle, path, identity);
   return {
     recorder,
-    hold(): void { gate = new Promise<void>(resolve => { unblock = resolve; }); },
+    hold(): void { entered = false; gate = new Promise<void>(resolve => { unblock = resolve; }); },
     release(): void { const resolve = unblock; gate = undefined; unblock = undefined; resolve?.(); },
     failWrites(): void { failed = true; },
     contents(): string { return written.join(''); },
     get handleClosed(): boolean { return closed; },
+    get hasBlockedWrite(): boolean { return entered; },
   };
 }
 
@@ -151,7 +160,7 @@ async function waitForRead(
  * Open a real session over a scripted channel and complete the shell handshake
  * by hand. The recorder is the controlled fake so cache-flush timing is exact.
  */
-async function scriptedSession(tag: string): Promise<{ session: TerminalSession; channel: ScriptedChannel; nonce: string; flush: FlushGate }> {
+async function scriptedSession(tag: string, writeWaitMs = 320): Promise<{ session: TerminalSession; channel: ScriptedChannel; nonce: string; flush: FlushGate }> {
   const channel = new ScriptedChannel();
   const identity: TerminalIdentity = { ip: '127.0.0.1', port: 22, username: 'scripted', codename: tag };
   const lease: ConnectionLease = {
@@ -162,7 +171,7 @@ async function scriptedSession(tag: string): Promise<{ session: TerminalSession;
   const root = resolve('vb-test/m0/session', `submission-${tag}-${process.pid}-${Date.now()}`);
   await fs.mkdir(root, { recursive: true });
   const flush = await gatedRecorder(identity, join(root, 'cache.log'));
-  const opened = TerminalSession.open(lease, identity, { initializationTimeoutMs: 4000, writeWaitMs: 320, recorder: flush.recorder });
+  const opened = TerminalSession.open(lease, identity, { initializationTimeoutMs: 4000, writeWaitMs, recorder: flush.recorder });
   await waitFor(() => /LSSH;([A-Za-z0-9_.-]+);STTY/.test(channel.outbound.join('')), 'the shell probe');
   const nonce = /LSSH;([A-Za-z0-9_.-]+);STTY/.exec(channel.outbound.join(''))![1]!;
   feed(channel, `${marker(nonce, 'STTY;0:0:0:0')}${marker(nonce, 'PROBE;bash')}`);
@@ -195,6 +204,257 @@ test('a prompt END observed while the pre-send flush is pending cannot consume t
     assert.ok(String(result.output).includes('syntax error'), 'the parse error must be cached in the submission round');
   } finally {
     await session.close().catch(() => undefined);
+  }
+});
+
+test('R02 the real round preview does not omit 501 characters after cursor-only CSI', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r02-preview');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_preview_command' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r02_preview_command\r'), 'preview handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'x'.repeat(501) + '\x1b[1C\r\n' + marker(nonce, 'END;0'));
+    const result = await outcome;
+    assert.equal(result.state, 'command_completed');
+    assert.equal(result.outputOmitted, false);
+    assert.equal(result.output, 'x'.repeat(501) + '\n');
+    assert.equal(result.outputCharacters, 502);
+  } finally { await session.close(); }
+});
+
+test('R02 a no-op character erase cannot force a 501-character real preview to be omitted', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r02-preview-padding');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_padding_command' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r02_padding_command\r'), 'padding preview handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'x'.repeat(501) + '\x1b[X\r\n' + marker(nonce, 'END;0'));
+    const result = await outcome;
+    assert.equal(result.state, 'command_completed');
+    assert.equal(result.outputOmitted, false);
+    assert.equal(result.outputCharacters, 502);
+    assert.equal(result.output, 'x'.repeat(501) + '\n');
+  } finally { await session.close(); }
+});
+
+test('R02 natural EOF drains every slice of one already-accepted output chunk', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce, flush } = await scriptedSession('r02-eof');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_eof_command' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r02_eof_command\r'), 'EOF handoff');
+    flush.hold();
+    const payload = marker(nonce, 'BEGIN') + Array.from({ length: 1200 }, (_, i) => `R02_EOF_ROW_${String(i + 1).padStart(4, '0')}\r\n`).join('') + 'R02_EOF_TAIL\r\n';
+    assert.ok(Buffer.byteLength(payload) < 32768, 'one realistic-sized, known accepted packet');
+    feed(channel, payload);
+    await waitFor(() => session.screen.snapshot().lines.some(line => line.includes('R02_EOF_ROW_')), 'first parsed slice before gated flush');
+    channel.emit('end'); channel.stderr.emit('end'); channel.emit('close');
+    await assert.rejects(session.write([{ type: 'text', text: 'never_after_eof' }]), error => error instanceof LiteSshError && error.code === 'TERMINAL_EXITED');
+    flush.release();
+    const result = await outcome;
+    const current = await session.read();
+    const body = flush.contents().split('\n').filter(line => /^\| R02_EOF_ROW_\d{4}$/.test(line));
+    assert.equal(body.length, 1200);
+    assert.ok(flush.contents().split('\n').includes('| R02_EOF_TAIL'));
+    assert.equal(result.code, 'TERMINAL_EXITED');
+    assert.equal(result.inputSent, true);
+    assert.equal(current.lastCompletedRound, null, 'EOF is not a fabricated END');
+    assert.ok(!channel.outbound.join('').includes('never_after_eof'));
+  } finally { flush.release(); await session.close(); }
+});
+
+test('R02 healthy stderr buffered at EOF drains and retains its real END fact', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce, flush } = await scriptedSession('r02-eof-stderr');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_stderr_command' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r02_stderr_command\r'), 'stderr handoff');
+    flush.hold();
+    feed(channel, marker(nonce, 'BEGIN') + 'S'.repeat(8000) + '\r\n');
+    await waitFor(() => session.screen.snapshot().lines.some(line => line.includes('SSSS')), 'stdout parsing before EOF');
+    // Not an emitted data event: these readable bytes remain buffered while
+    // attach() has paused stderr. Only healthy receive-side resumption delivers them.
+    channel.stderr.push(Buffer.from('R02_BUFFERED_STDERR\r\n' + marker(nonce, 'END;23')));
+    channel.stderr.push(null);
+    channel.emit('end'); channel.emit('close');
+    flush.release();
+    await outcome;
+    const current = await waitForRead(session, value => (value.lastCompletedRound as { exitCode?: number } | null)?.exitCode === 23, 'actual stderr END');
+    assert.equal(current.code, 'TERMINAL_EXITED');
+    assert.equal(current.currentRound, null);
+    assert.ok(flush.contents().split('\n').includes('| R02_BUFFERED_STDERR'));
+  } finally { flush.release(); await session.close(); }
+});
+
+test('R02 recording EIO after EOF stops queued parsing and exposes the actual loss reason', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce, flush } = await scriptedSession('r02-eof-eio');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_eof_eio_command' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r02_eof_eio_command\r'), 'EOF EIO handoff');
+    flush.hold();
+    feed(channel, marker(nonce, 'BEGIN') + 'P'.repeat(12000) + '\r\n');
+    await waitFor(() => session.screen.snapshot().lines.some(line => line.includes('PPPP')), 'first slice before EIO');
+    channel.stderr.emit('data', Buffer.from('NEVER_PARSE_AFTER_EIO\r\n' + marker(nonce, 'END;0')));
+    channel.emit('end'); channel.stderr.emit('end'); channel.emit('close');
+    flush.failWrites(); flush.release();
+    const result = await outcome;
+    await assert.rejects(session.read(), error => error instanceof LiteSshError && error.code === 'CACHE_WRITE_FAILED' && error.details.reason === 'EIO');
+    assert.equal(result.code, 'TERMINAL_EXITED', 'preserve the factual sticky transport fault');
+    assert.equal(result.recordingErrorCode, 'CACHE_WRITE_FAILED');
+    assert.equal(result.reason, 'EIO');
+    assert.ok(Number(result.droppedChunks) > 0 && Number(result.droppedBytes) > 0);
+    assert.equal(result.cacheMayBeIncomplete, true);
+    assert.equal(result.lastCompletedRound, null);
+    assert.ok(!(result.screen as { lines: string[] }).lines.some(line => line.includes('NEVER_PARSE_AFTER_EIO')));
+    assert.ok(!flush.contents().includes('NEVER_PARSE_AFTER_EIO'));
+  } finally { flush.release(); await session.close(); }
+});
+
+test('R02 cancellation during pre-send flush never becomes a late native handoff', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce, flush } = await scriptedSession('r02-cancel-unsent');
+  const controller = new AbortController();
+  try {
+    flush.hold();
+    const outcome = session.write([{ type: 'text', text: 'r02_cancel_unsent' }, { type: 'key', key: 'ENTER' }], controller.signal).catch(error => error);
+    await waitFor(() => flush.hasBlockedWrite, 'pre-handoff cache flush');
+    controller.abort(); flush.release();
+    const error: unknown = await outcome;
+    assert.ok(error instanceof LiteSshError && error.code === 'REQUEST_CANCELLED');
+    assert.equal(error.details.inputSent, false);
+    assert.ok(!channel.outbound.join('').includes('r02_cancel_unsent'));
+    assert.equal((await session.read()).currentRound, null);
+    const next = session.write([{ type: 'text', text: 'r02_after_unsent' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r02_after_unsent\r'), 'new clean handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'OK\r\n' + marker(nonce, 'END;0'));
+    assert.equal((await next).state, 'command_completed');
+  } finally { controller.abort(); flush.release(); await session.close(); }
+});
+
+test('R02 cancelling an already-sent observer preserves later factual shell rounds', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r02-cancel-facts');
+  const controller = new AbortController();
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_cancel_sent' }, { type: 'key', key: 'ENTER' }], controller.signal);
+    await waitFor(() => channel.outbound.includes('r02_cancel_sent\r'), 'cancelled actual handoff');
+    controller.abort();
+    const result = await outcome;
+    assert.equal(result.observationCancelled, true);
+    assert.equal(result.inputSent, true);
+    assert.equal(result.inputHandled, 'unknown');
+    assert.equal(session.status, 'open');
+    feed(channel, marker(nonce, 'BEGIN') + 'R02_FACT_AFTER_CANCEL\r\n' + marker(nonce, 'END;9'));
+    const current = await waitForRead(session, value => (value.lastCompletedRound as { exitCode?: number } | null)?.exitCode === 9, 'factual round after cancellation');
+    assert.equal(current.currentRound, null);
+    assert.equal(channel.outbound.filter(packet => packet === 'r02_cancel_sent\r').length, 1);
+    assert.ok(!channel.outbound.some(packet => packet.includes('\x03')));
+  } finally { controller.abort(); await session.close(); }
+});
+
+test('R02 cancellation racing owned close does not report an open pending terminal', { timeout: 10_000 }, async () => {
+  const { session, channel } = await scriptedSession('r02-cancel-close');
+  const controller = new AbortController();
+  let closing: Promise<Record<string, unknown>> | undefined;
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_cancel_close' }], controller.signal);
+    await waitFor(() => channel.outbound.includes('r02_cancel_close'), 'close-race handoff');
+    controller.abort(); closing = session.close();
+    const result = await outcome;
+    assert.ok(result.state === 'closing' || result.state === 'closed');
+    assert.equal(result.inputSent, true);
+    assert.equal((await closing).cacheRemoved, true);
+    assert.equal((await session.read()).state, 'closed');
+  } finally { controller.abort(); await closing; await session.close(); }
+});
+
+test('R02 cancelled queued handoffs remain bounded behind a blocked cache flush', { timeout: 10_000 }, async () => {
+  const { session, channel, flush } = await scriptedSession('r02-cancel-queue', 30_000);
+  const controllers: AbortController[] = [];
+  const calls: Promise<unknown>[] = [];
+  let rejected = 0;
+  try {
+    flush.hold();
+    const head = new AbortController(); controllers.push(head);
+    calls.push(session.write([{ type: 'text', text: 'r02_blocked_head' }, { type: 'key', key: 'ENTER' }], head.signal).catch(error => error));
+    await waitFor(() => flush.hasBlockedWrite, 'blocked head handoff');
+    // Eighty tiny owned requests suffice to prove the bound without allocating
+    // huge payloads or intentionally exhausting the machine's memory.
+    for (let i = 0; i < 80; i++) {
+      const controller = new AbortController(); controllers.push(controller);
+      calls.push(session.write([{ type: 'text', text: `r02_queued_cancel_${i}` }], controller.signal).catch(error => {
+        if (error instanceof LiteSshError && error.code === 'RESOURCE_LIMIT') rejected++;
+        return error;
+      }));
+      controller.abort();
+    }
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(rejected, 17, 'one blocked head plus 63 retained tasks fill the separate 64-handoff bound');
+    assert.ok(!channel.outbound.join('').includes('r02_queued_cancel_'));
+  } finally {
+    controllers.forEach(controller => controller.abort()); flush.release();
+    await Promise.all(calls); await session.close();
+  }
+});
+
+test('R02 public diagnostic details cannot replace authoritative terminal or handoff fields', { timeout: 10_000 }, async t => {
+  const { session, channel, nonce, flush } = await scriptedSession('r02-detail-authority');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r02_detail_command' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r02_detail_command\r'), 'diagnostic handoff');
+    t.mock.method(flush.recorder, 'recordLine', () => {
+      throw new LiteSshError('CACHE_WRITE_FAILED', 'Controlled public recording failure.', {
+        reason: 'EIO', droppedChunks: 2, droppedBytes: 17,
+        ok: true, state: 'open', code: 'FOREIGN', message: 'foreign message',
+        terminal: { codename: 'foreign' }, cachePath: 'foreign-path',
+        inputSent: false, inputHandled: 'foreign', cacheMayBeIncomplete: false,
+      });
+    });
+    feed(channel, marker(nonce, 'BEGIN') + 'diagnostic body\r\n');
+    const result = await outcome;
+    assert.equal(result.reason, 'EIO');
+    assert.equal(result.droppedChunks, 2); assert.equal(result.droppedBytes, 17);
+    assert.equal(result.ok, false); assert.equal(result.state, 'error');
+    assert.equal(result.code, 'CACHE_WRITE_FAILED');
+    assert.equal(result.message, 'Controlled public recording failure.');
+    assert.deepEqual(result.terminal, session.identity);
+    assert.equal(result.cachePath, session.recorder.path);
+    assert.equal(result.inputSent, true); assert.equal(result.inputHandled, 'unknown');
+    assert.equal(result.cacheMayBeIncomplete, true);
+  } finally { t.mock.restoreAll(); await session.close(); }
+});
+
+test('R02 genuine SDK cancellations free observer quota without double release or remote controls', { timeout: 15_000 }, async () => {
+  const { session, channel } = await scriptedSession('r02_sdk_cancel', 30_000);
+  const client = new McpClient({ name: 'r02-cancel-regression', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const signals: AbortSignal[] = [];
+  const terminals = { write: (_target: TerminalTarget, actions: InputAction[], signal?: AbortSignal) => {
+    if (signal) signals.push(signal);
+    return session.write(actions, signal);
+  } } as unknown as TerminalService;
+  const server = createMcpServer({} as ConfigStore, {} as ConnectionPool, terminals);
+  const controllers: AbortController[] = [];
+  const calls: Promise<unknown>[] = [];
+  const target = { ip: '127.0.0.1', port: 22, codename: 'r02_sdk_cancel' };
+  try {
+    await server.connect(serverTransport); await client.connect(clientTransport);
+    for (let i = 0; i < 64; i++) {
+      const controller = new AbortController(); controllers.push(controller);
+      calls.push(client.callTool({ name: 'lite_ssh_terminal_write', arguments: { ...target, actions: [{ type: 'text', text: `r02_cancel_${i}` }] } }, undefined, { signal: controller.signal }).catch(error => error));
+    }
+    await waitFor(() => channel.outbound.filter(packet => /^r02_cancel_\d+$/.test(packet)).length === 64, '64 actual SDK handoffs');
+    controllers.forEach(controller => controller.abort()); await Promise.all(calls);
+    await waitFor(() => signals.length === 64 && signals.every(signal => signal.aborted), '64 SDK server-side abort signals');
+    // Refill every slot: a later 65th rejection proves cancel/finally did not
+    // decrement twice and silently allow a negative observer count.
+    for (let i = 0; i < 64; i++) {
+      const controller = new AbortController(); controllers.push(controller);
+      calls.push(client.callTool({ name: 'lite_ssh_terminal_write', arguments: { ...target, actions: [{ type: 'text', text: `r02_refill_${i}` }] } }, undefined, { signal: controller.signal }).catch(error => error));
+    }
+    await waitFor(() => channel.outbound.filter(packet => /^r02_refill_\d+$/.test(packet)).length === 64, '64 fresh admissions after cancellations');
+    const overflow = await client.callTool({ name: 'lite_ssh_terminal_write', arguments: { ...target, actions: [{ type: 'text', text: 'r02_must_reject_65' }] } });
+    assert.equal((overflow.structuredContent as Record<string, unknown>).code, 'RESOURCE_LIMIT');
+    assert.ok(!channel.outbound.includes('r02_must_reject_65'));
+    assert.ok(!channel.outbound.some(packet => packet.includes('\x03')));
+    assert.equal(session.status, 'open');
+  } finally {
+    controllers.forEach(controller => controller.abort()); await Promise.all(calls);
+    await session.close(); await client.close(); await server.close();
   }
 });
 
@@ -401,6 +661,9 @@ test('R01 a cache EIO after handoff retains transmission and integrity context',
     assert.equal(result.inputSent, true, 'do not replace a known handed-off packet with a generic error');
     assert.equal(result.ok, false);
     assert.equal(result.code, 'CACHE_WRITE_FAILED');
+    assert.equal(result.reason, 'EIO');
+    assert.ok(Number(result.droppedChunks) > 0);
+    assert.ok(Number(result.droppedBytes) > 0);
     assert.equal(result.inputHandled, 'unknown');
     assert.equal(result.cacheMayBeIncomplete, true);
     assert.ok(result.terminal);

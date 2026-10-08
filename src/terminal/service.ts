@@ -84,7 +84,7 @@ export class TerminalService {
     return entry.session;
   }
   read(target: TerminalTarget): Promise<Record<string, unknown>> { return this.bind(target).read(); }
-  write(target: TerminalTarget, actions: InputAction[]): Promise<Record<string, unknown>> { return this.bind(target).write(actions); }
+  write(target: TerminalTarget, actions: InputAction[], signal?: AbortSignal): Promise<Record<string, unknown>> { return this.bind(target).write(actions, signal); }
   resize(target: TerminalTarget, cols: number, rows: number): Promise<Record<string, unknown>> { return this.bind(target).resize(cols, rows); }
   async close(target: TerminalTarget): Promise<Record<string, unknown>> {
     const session = this.bind(target);

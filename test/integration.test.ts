@@ -23,6 +23,43 @@ async function fixture(pinned = false, options: { lateSecondShellMs?: number; in
   const app = createApplication({ configPath, cacheRoot: join(root, 'cache'), writeWaitMs: 180, initializationTimeoutMs: options.initializationTimeoutMs ?? 2000 });
   return { ssh, app, root, target: { ip: ssh.ip, port: ssh.port, username: ssh.username }, terminal: (codename: string) => ({ ip: ssh.ip, port: ssh.port, codename }) };
 }
+test('R02 SDK cancellation reaches the concrete terminal through the service without dispatching input', { timeout: 10_000 }, async t => {
+  const { ssh, app, target, terminal } = await fixture(true);
+  const client = new Client({ name: 'r02-bound-signal-fixture', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const controller = new AbortController();
+  const observed: { signal?: AbortSignal } = {};
+  let call: Promise<unknown> | undefined;
+  try {
+    await app.server.connect(serverTransport); await client.connect(clientTransport);
+    await app.terminals.open(target, 'r02_bound_signal');
+    // Keep the real MCP dispatch, service binding and owned PTY, but replace
+    // only its public write boundary: this test sends no command to the peer.
+    const spy = t.mock.method(TerminalSession.prototype, 'write', async (actions: InputAction[], signal?: AbortSignal): Promise<Record<string, unknown>> => {
+      assert.deepEqual(actions, [{ type: 'text', text: 'not_dispatched' }]);
+      observed.signal = signal;
+      assert.ok(signal);
+      await new Promise<void>(resolve => {
+        signal.addEventListener('abort', () => resolve(), { once: true });
+        if (signal.aborted) resolve();
+      });
+      return { ok: true, state: 'pending', inputSent: false, observationCancelled: true };
+    });
+    call = client.callTool({ name: 'lite_ssh_terminal_write', arguments: { ...terminal('r02_bound_signal'), actions: [{ type: 'text', text: 'not_dispatched' }] } }, undefined, { signal: controller.signal }).catch(error => error);
+    const deadline = Date.now() + 3000;
+    while (!observed.signal && Date.now() < deadline) await new Promise<void>(resolve => setTimeout(resolve, 5));
+    assert.ok(observed.signal, 'SDK extra.signal must survive dispatch and concrete service binding');
+    controller.abort(); await call;
+    while (!observed.signal.aborted && Date.now() < deadline) await new Promise<void>(resolve => setTimeout(resolve, 5));
+    assert.equal(observed.signal.aborted, true);
+    assert.equal(spy.mock.callCount(), 1);
+    assert.equal((await app.terminals.read(terminal('r02_bound_signal'))).state, 'open');
+  } finally {
+    controller.abort(); await call;
+    t.mock.restoreAll(); await client.close(); await app.close(); await ssh.close();
+  }
+});
+
 const command = (text: string): InputAction[] => [{ type: 'text', text }, { type: 'key', key: 'ENTER' }];
 
 /** Tests may wait/read after a pending observation; never send the original input twice. */

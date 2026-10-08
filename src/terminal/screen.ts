@@ -117,10 +117,12 @@ interface CaptureCursor {
   emittedSeq: number;
   /** Bounded readable row prefix; detects implicit overwrite after reflow. */
   emittedText: string;
+  /** At most the visible row count; permits backward addressing without duplicates. */
+  addressedRows: Map<number, string>;
 }
 
 function newCursor(): CaptureCursor {
-  return { emittedSeq: -1, emittedText: '' };
+  return { emittedSeq: -1, emittedText: '', addressedRows: new Map() };
 }
 
 /** Do not split a newly changed surrogate pair at a shared high surrogate. */
@@ -209,11 +211,17 @@ export class ScreenModel {
       eraseCapture('K'),
       // Cursor addressing can replace cells without CR/BS or erase. Preserve
       // the chronological text/styles before xterm moves the write position.
-      ...['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'f', 'd', 'L', 'M', 'S', 'T'].map(final =>
-        this.terminal.parser.registerCsiHandler({ final }, () => {
+      ...['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'f', 'd', 'L', 'M', 'S', 'T', 'X', 'P', '@'].map(final =>
+        this.terminal.parser.registerCsiHandler({ final }, (params) => {
           this.flushLine();
           this.onFrame?.(this.buildSnapshot(), 'cursor-address');
-          this.forgetEmitted(this.terminal.buffer.active);
+          const buffer = this.terminal.buffer.active;
+          if (['X', 'P', '@'].includes(final)) {
+            // Character edits over unused padding do not change body identity.
+            // Printed spaces and either half of a wide glyph are occupied cells.
+            if (this.characterEditTouchesText(buffer, final, params)) this.forgetEmitted(buffer);
+          } else if (['L', 'M', 'S', 'T'].includes(final)) this.forgetEmitted(buffer);
+          else this.preserveAddressedRows(buffer);
           return false;
         })),
       this.terminal.buffer.onBufferChange(buffer => {
@@ -467,14 +475,17 @@ export class ScreenModel {
     let seenText = '';
     for (let row = start; row <= endRow; row += 1) {
       const seq = row + evicted;
-      if (seq < cursor.emittedSeq) continue; // Row already emitted in full.
+      if (seq < cursor.emittedSeq && !cursor.addressedRows.has(seq)) continue; // No addressed-row mutation to inspect.
       const line = buffer.getLine(row);
       const text = line ? readableRow(line, this.terminal.cols, nullCell) : '';
       // A narrowing resize can clamp the insertion cursor inside old cells.
       // Length-only dedup would discard their replacement glyph. Compare the
       // actual readable prefix, keeping unchanged cells but emitting mutations.
-      const prefix = seq === cursor.emittedSeq ? commonReadablePrefix(cursor.emittedText, text) : 0;
+      const addressed = cursor.addressedRows.get(seq);
+      const previous = addressed ?? (seq === cursor.emittedSeq ? cursor.emittedText : undefined);
+      const prefix = previous === undefined ? 0 : commonReadablePrefix(previous, text);
       const chunk = text.slice(prefix);
+      if (addressed !== undefined) cursor.addressedRows.set(seq, text);
       seenSeq = seq;
       seenText = text;
       if (terminating && row === endRow) tail = chunk;
@@ -483,7 +494,10 @@ export class ScreenModel {
     if (head.length > 0) this.emitLine(head, true, buffer.type);
     if (terminating) {
       this.emitLine(tail ?? '', false, buffer.type);
-      this.forgetEmitted(buffer);
+      cursor.emittedSeq = -1;
+      cursor.emittedText = '';
+      // LF is not an overwrite: keep bounded addressed-row baselines so moving
+      // back to unchanged older cells cannot repeat their body after this LF.
     } else if (seenSeq >= 0) {
       cursor.emittedSeq = seenSeq;
       cursor.emittedText = seenText;
@@ -501,11 +515,50 @@ export class ScreenModel {
     return Math.max(0, this.evictBaseLength[type] + created - buffer.length);
   }
 
+  /** ECH changes only its count range; DCH/ICH shift the remaining row. Use
+   * public cell occupancy, not trimmed text length or Unicode/column arithmetic. */
+  private characterEditTouchesText(buffer: IBuffer, final: string, params: readonly (number | number[])[]): boolean {
+    const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+    if (!line) return false;
+    const column = Math.min(buffer.cursorX, this.terminal.cols - 1);
+    const first = params[0];
+    const rawCount = Array.isArray(first) ? first[0] : first;
+    const count = typeof rawCount === 'number' ? Math.max(1, rawCount) : 1;
+    const end = final === 'X' ? Math.min(this.terminal.cols, column + count) : this.terminal.cols;
+    // Erasing a continuation can erase the wide character that owns it.
+    const start = column > 0 && line.getCell(column)?.getWidth() === 0 &&
+      line.getCell(column - 1)?.getWidth() === 2 ? column - 1 : column;
+    for (let col = start; col < end; col++) {
+      if (line.getCell(col)?.getChars()) return true;
+    }
+    return false;
+  }
+
+  /** Public cursor coordinates may address any visible row, including an older
+   * one. Seed only already-emitted rows before xterm moves; no CSI arithmetic,
+   * origin-mode guesses, private API, or unbounded whole-buffer history. */
+  private preserveAddressedRows(buffer: IBuffer): void {
+    const cursor = this.cursors[buffer.type];
+    const previous = cursor.addressedRows;
+    const retained = new Map<number, string>();
+    const evicted = this.evictedRows(buffer);
+    const cell = buffer.getNullCell();
+    const end = Math.min(buffer.length, buffer.baseY + this.terminal.rows);
+    for (let row = buffer.baseY; row < end; row++) {
+      const seq = row + evicted;
+      if (seq > cursor.emittedSeq && !previous.has(seq)) continue;
+      const line = buffer.getLine(row);
+      if (line) retained.set(seq, readableRow(line, this.terminal.cols, cell));
+    }
+    cursor.addressedRows = retained;
+  }
+
   /** Marks the current logical line as fully un-emitted (fresh identity). */
   private forgetEmitted(buffer: IBuffer): void {
     const cursor = this.cursors[buffer.type];
     cursor.emittedSeq = -1;
     cursor.emittedText = '';
+    cursor.addressedRows.clear();
   }
 
   /**

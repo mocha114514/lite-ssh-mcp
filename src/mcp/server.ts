@@ -74,7 +74,7 @@ export function createMcpServer(store: ConfigStore, pool: ConnectionPool, termin
     title: 'Write terminal actions', description: 'Type text, bracketed paste or named keys. Ordinary completion requires a trusted shell END event. Screen changes or input transmission do not prove every key was handled; deadlines never trigger replay.',
     inputSchema: z.strictObject({ ...target, actions: z.array(action).min(1).max(64) }), outputSchema,
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
-  }, args => dispatch(() => terminals.write(args, args.actions as InputAction[])));
+  }, (args, extra) => dispatch(() => terminals.write(args, args.actions as InputAction[], extra.signal)));
   server.registerTool('lite_ssh_terminal_read', {
     title: 'Read current terminal screen', description: 'Read only the current parsed character screen, cursor, styles and round state. No history/view/delta parameter; use local file tools on cachePath for history.',
     inputSchema: z.strictObject(target), outputSchema,

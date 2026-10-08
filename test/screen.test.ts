@@ -70,6 +70,104 @@ test('R01 cursor-addressed TUI overwrites retain ordered styled frames even in o
   } finally { model.dispose(); }
 });
 
+test('R02 cursor-only CSI does not append the unchanged body again', async () => {
+  const h = harness();
+  try {
+    await h.model.write('ABC\x1b[1C\r\n');
+    h.model.flushLine();
+    const body = h.lines.map(line => line.text + (line.newline ? '\n' : '')).join('');
+    assert.equal(body, 'ABC\n');
+    assert.equal([...body].length, 4);
+  } finally { h.model.dispose(); }
+});
+
+test('R02 cursor-only CSI keeps a wrapped 501-character body below the preview limit', async () => {
+  const h = harness();
+  try {
+    await h.model.write('x'.repeat(501) + '\x1b[1C\r\n');
+    h.model.flushLine();
+    const body = h.lines.map(line => line.text + (line.newline ? '\n' : '')).join('');
+    assert.equal(body, 'x'.repeat(501) + '\n');
+    assert.equal([...body].length, 502);
+  } finally { h.model.dispose(); }
+});
+
+test('R02 backward cursor addressing records changed earlier cells but not unchanged later rows', async () => {
+  const h = harness();
+  try {
+    await h.model.write('ABC\r\nDEF\x1b[1;1HXYZ\r\n' + encodeMarkerOsc(NONCE, 'END;0'));
+    h.model.flushLine();
+    const body = h.lines.map(line => line.text + (line.newline ? '\n' : '')).join('');
+    assert.ok(body.includes('XYZ'), 'the old last-row threshold must not hide the rewritten earlier row');
+    assert.equal(body.split('ABC').length - 1, 1);
+    assert.equal(body.split('DEF').length - 1, 1, 'LF must not forget the unchanged addressed-row baseline');
+    assert.equal(body.split('XYZ').length - 1, 1);
+  } finally { h.model.dispose(); }
+});
+
+test('R02 dedup of cursor-only movement retains styled frames and actual cursor coordinates', async () => {
+  const lines: ParsedLine[] = [];
+  const frames: ReturnType<ScreenModel['snapshot']>[] = [];
+  const model = new ScreenModel({ nonce: NONCE, cols: 20, rows: 3,
+    onLine: line => lines.push(line), onFrame: frame => frames.push(frame) });
+  try {
+    const snapshot = await model.write('\x1b[31mABC\x1b[1C' + encodeMarkerOsc(NONCE, 'END;0'));
+    assert.equal(lines.map(line => line.text).join(''), 'ABC');
+    assert.ok(frames.some(frame => frame.lines[0] === 'ABC' && frame.styles.length > 0));
+    assert.deepEqual(snapshot.cursor, { x: 4, y: 0 });
+    assert.ok(snapshot.styles.length > 0);
+  } finally { model.dispose(); }
+});
+
+test('R02 character erase followed by identical glyphs remains genuinely new body', async () => {
+  const h = harness();
+  try {
+    await h.model.write('ABC\x1b[1G\x1b[3XABC\r\n');
+    const body = h.lines.map(line => line.text + (line.newline ? '\n' : '')).join('');
+    assert.equal(body, 'ABCABC\n', 'ECH must invalidate the pre-addressed prefix just like other real erases');
+  } finally { h.model.dispose(); }
+});
+
+for (const final of ['X', 'P', '@']) {
+  test(`R02 character edit ${final} over unused padding does not repeat occupied body`, async () => {
+    const h = harness();
+    try {
+      await h.model.write(`ABC\x1b[${final}\r\n`);
+      h.model.flushLine();
+      assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABC\n');
+    } finally { h.model.dispose(); }
+  });
+}
+
+test('R02 ECH over unused padding leaves a wrapped 501-character body below the preview limit', async () => {
+  const h = harness();
+  try {
+    await h.model.write('x'.repeat(501) + '\x1b[X\r\n');
+    h.model.flushLine();
+    const body = h.lines.map(line => line.text + (line.newline ? '\n' : '')).join('');
+    assert.equal(body, 'x'.repeat(501) + '\n');
+    assert.equal([...body].length, 502);
+  } finally { h.model.dispose(); }
+});
+
+test('R02 ECH range ending before a later occupied cell keeps unchanged body dedup', async () => {
+  const h = harness();
+  try {
+    await h.model.write('ABC\x1b[6GZ\x1b[4G\x1b[X\r\n');
+    h.model.flushLine();
+    assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABC  Z\n');
+  } finally { h.model.dispose(); }
+});
+
+test('R02 printed spaces erased and rewritten are occupied output, not unused padding', async () => {
+  const h = harness();
+  try {
+    await h.model.write('ABC   \x1b[4G\x1b[3X   \r\n');
+    h.model.flushLine();
+    assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABC   ABC   \n');
+  } finally { h.model.dispose(); }
+});
+
 interface Harness {
   model: ScreenModel;
   lines: ParsedLine[];

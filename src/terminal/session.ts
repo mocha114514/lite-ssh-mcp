@@ -73,6 +73,8 @@ export class TerminalSession {
   private readonly writeWait: number;
   private eventSequence = 0;
   private failure?: LiteSshError;
+  /** Receive-side health is separate: remote EOF must not discard accepted bytes. */
+  private recordingFailure?: LiteSshError;
   /** The single open cache round/candidate; see {@link Cycle}. */
   private cycle?: Cycle;
   /**
@@ -89,6 +91,9 @@ export class TerminalSession {
   private readonly waitingOwners = new Set<number>();
   private readonly ownerResults = new Map<number, { result: RoundResult; sequence: number }>();
   private activeWrites = 0;
+  /** Cancelled observers may leave work behind a blocked flush: cap those
+   * retained action closures separately until their actual handoff task settles. */
+  private retainedHandoffs = 0;
   /** Batch origin survives observer expiry; expiry is not an all-input ACK. */
   private batchOwner?: number;
   /** Once boundaries mix, this PTY keeps factual rounds but never guesses ownership. */
@@ -107,11 +112,11 @@ export class TerminalSession {
     this.screen = new ScreenModel({
       nonce: this.nonce, cols: options.cols ?? 80, rows: options.rows ?? 24,
       onLine: line => {
-        try { this.recorder.recordLine(line); } catch (error) { this.fail(error, 'CACHE_WRITE_FAILED'); }
+        try { this.recorder.recordLine(line); } catch (error) { this.failRecording(error); }
       },
       onMarker: marker => this.onMarker(marker),
       onFrame: (snapshot, label) => {
-        try { this.recorder.recordFrame(snapshot, label); } catch (error) { this.fail(error, 'CACHE_WRITE_FAILED'); }
+        try { this.recorder.recordFrame(snapshot, label); } catch (error) { this.failRecording(error); }
       },
       // Protocol replies must not wait behind a tool's remote-output waiter.
       onReply: data => {
@@ -172,17 +177,19 @@ export class TerminalSession {
       channel.stderr.pause();
       const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
       void this.output.run(async () => {
+        if (this.recordingFailure) throw this.recordingFailure;
         // Bound a parser/write transaction so line callbacks cannot queue an entire huge burst.
         for (let offset = 0; offset < bytes.length; offset += 4096) {
           const snapshot = await this.screen.write(bytes.subarray(offset, offset + 4096));
           this.recorder.recordFrame(snapshot);
           await this.recorder.flush();
           this.notify();
-          if (this.failure) throw this.failure;
+          // EOF/error forbids new input, not healthy recording of received data.
+          if (this.recordingFailure) throw this.recordingFailure;
         }
-      }).catch(error => this.fail(error, 'CACHE_WRITE_FAILED')).finally(() => {
+      }).catch(error => this.failRecording(error)).finally(() => {
         // Closing still drains already-received buffered data; never freeze a paused stream.
-        if (this.status !== 'closed' && !this.failure) {
+        if (this.status !== 'closed' && !this.recordingFailure) {
           channel.resume();
           channel.stderr.resume();
         }
@@ -202,6 +209,12 @@ export class TerminalSession {
       this.ended.resolve();
       this.notify();
     });
+  }
+
+  private failRecording(error: unknown): void {
+    this.recordingFailure ??= error instanceof LiteSshError ? error :
+      new LiteSshError('CACHE_WRITE_FAILED', 'The parsed terminal recording failed; input has not been replayed.');
+    this.fail(this.recordingFailure, 'CACHE_WRITE_FAILED');
   }
 
   private fail(error: unknown, code: string): void {
@@ -306,7 +319,7 @@ export class TerminalSession {
         }
         this.notify();
       }
-    }).catch(error => this.fail(error, 'CACHE_WRITE_FAILED'));
+    }).catch(error => this.failRecording(error));
   }
 
   /** Future input is not a shell cycle until a real BEGIN/END claims it. */
@@ -441,6 +454,10 @@ export class TerminalSession {
 
   private current(): Record<string, unknown> {
     return {
+      // LiteSshError details are deliberately public. Owner/status fields below
+      // remain authoritative; a prior transport fault must not hide later EIO loss.
+      ...(this.failure?.details ?? {}), ...(this.recordingFailure?.details ?? {}),
+      ...(this.recordingFailure && this.recordingFailure !== this.failure ? { recordingErrorCode: this.recordingFailure.code } : {}),
       ok: !this.failure, state: this.status === 'closed' ? 'closed' : this.failure ? 'error' : this.status,
       terminal: { ...this.identity }, cachePath: this.recorder.path,
       currentRound: this.activeRound() ?? null, lastCompletedRound: this.lastResult ?? null,
@@ -456,9 +473,11 @@ export class TerminalSession {
     return this.current();
   }
 
-  async write(actions: InputAction[]): Promise<Record<string, unknown>> {
+  async write(actions: InputAction[], signal?: AbortSignal): Promise<Record<string, unknown>> {
+    if (signal?.aborted) throw new LiteSshError('REQUEST_CANCELLED', 'Observation cancelled before input handoff.', { inputSent: false });
     if (!actions.length || actions.length > 64) throw new LiteSshError('INVALID_ACTIONS', 'Provide 1 through 64 input actions.');
     if (this.activeWrites >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 active-input-observer budget.');
+    if (this.retainedHandoffs >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 retained-input-handoff budget.');
     // Set inside the send transaction, before `sent` flips; the initial value is
     // never observed because the listener ignores events until `sent` is true.
     let observeScreenChange = true;
@@ -471,8 +490,30 @@ export class TerminalSession {
     let token: number | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let listener: (() => void) | undefined;
+    let onAbort: (() => void) | undefined;
+    let released = false;
     this.activeWrites++;
-    const observation = new Promise<'event' | 'deadline'>(resolve => {
+    this.retainedHandoffs++;
+    // Cancellation frees only this observer, never the remote input or PTY.
+    // Idempotence covers abort racing ordinary completion and owned close.
+    const releaseObserver = (): void => {
+      if (released) return;
+      released = true;
+      this.activeWrites--;
+      if (token !== undefined) {
+        if (this.pendingTokens.includes(token) ||
+            (this.cycle?.owner === token && !this.cycle.started && !this.ownerResults.has(token))) {
+          this.ownershipAmbiguous = true;
+        }
+        this.waitingOwners.delete(token);
+        this.ownerResults.delete(token);
+        this.pendingTokens = this.pendingTokens.filter(pending => pending !== token);
+      }
+      if (timer) clearTimeout(timer);
+      if (listener) this.events.off('change', listener);
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
+    };
+    const observation = new Promise<'event' | 'deadline' | 'cancelled'>(resolve => {
       listener = (): void => {
         if (!sent) return;
         if (this.failure || this.status !== 'open') { resolve('event'); return; }
@@ -489,9 +530,13 @@ export class TerminalSession {
       };
       this.events.on('change', listener);
       timer = setTimeout(() => resolve('deadline'), this.writeWait);
+      onAbort = (): void => { releaseObserver(); resolve('cancelled'); };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
     });
     try {
       await this.sends.run(async () => {
+        if (signal?.aborted) throw new LiteSshError('REQUEST_CANCELLED', 'Observation cancelled before input handoff.', { inputSent: false });
         if (this.status !== 'open' || this.failure) throw this.failure ?? new LiteSshError('TERMINAL_CLOSED', 'The terminal is not open.');
         // Fail fast: an invalid batch must not touch the cache at all. The
         // authoritative encode happens after the flush, against the screen as
@@ -509,6 +554,7 @@ export class TerminalSession {
         // was pending, so the bytes actually sent must match the mode at send
         // time. A paste whose bracketed mode was lost is rejected here, before
         // anything leaves for the shell.
+        if (signal?.aborted) throw new LiteSshError('REQUEST_CANCELLED', 'Observation cancelled before input handoff.', { inputSent: false });
         if (this.status !== 'open' || this.failure) throw this.failure ?? new LiteSshError('TERMINAL_CLOSED', 'The terminal stopped before handoff.');
         const { packet, submissions } = encodeBatch(actions, this.screen.snapshot());
         if (Buffer.byteLength(packet, 'utf8') > 65_536) throw new LiteSshError('RESOURCE_LIMIT', 'This input batch exceeds the M0 64 KiB transport budget.');
@@ -529,8 +575,14 @@ export class TerminalSession {
         }
         sent = true;
         listener?.();
-      });
+      }).finally(() => { this.retainedHandoffs--; });
       const reason = await observation;
+      if (reason === 'cancelled') {
+        const view = this.current();
+        return { ...view, state: view.ok && this.status === 'open' ? 'pending' : view.state,
+          inputSent: true, inputHandled: 'unknown', observationCancelled: true,
+          message: 'Observation cancelled. Queued input was not reversed; no Ctrl-C, replay, or terminal close was performed.' };
+      }
       await this.output.drain();
       await this.roundWrites.drain();
       await this.recorder.flush();
@@ -552,25 +604,13 @@ export class TerminalSession {
       if (!sent) throw error;
       // A post-handoff disk/transport failure must not erase the known effect.
       // Never replay: queue acceptance proves neither delivery nor key handling.
-      this.fail(error, 'CACHE_WRITE_FAILED');
+      if (error instanceof LiteSshError && error.code === 'CACHE_WRITE_FAILED') this.failRecording(error);
+      else this.fail(error, 'CACHE_WRITE_FAILED');
       return { ...this.current(), inputSent: true, inputHandled: 'unknown', cacheMayBeIncomplete: true };
     } finally {
-      this.activeWrites--;
-      if (token !== undefined) {
-        // An expired, still-unclaimed credit must not become a future caller's
-        // round. Preserve uncertainty rather than silently declaring input drained.
-        if (this.pendingTokens.includes(token) ||
-            (this.cycle?.owner === token && !this.cycle.started && !this.ownerResults.has(token))) {
-          this.ownershipAmbiguous = true;
-        }
-        this.waitingOwners.delete(token);
-        this.ownerResults.delete(token);
-        this.pendingTokens = this.pendingTokens.filter(pending => pending !== token);
-        // batchOwner is a single bounded origin token, retained after expiry;
-        // only a fresh PTY can prove a clean boundary after ambiguous mixing.
-      }
-      if (timer) clearTimeout(timer);
-      if (listener) this.events.off('change', listener);
+      releaseObserver();
+      // batchOwner is a bounded origin retained after cancellation/expiry:
+      // neither event proves all queued input was handled.
     }
   }
 
