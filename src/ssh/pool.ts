@@ -14,6 +14,8 @@ const MAX_CONNECTIONS = 32;
 const CLOSE_GRACE_MS = 2_000;
 
 interface HostKeyObservation {
+  /** Trust pin used when this concrete server key was observed. */
+  configuredFingerprint: string | undefined;
   fingerprint: string;
   keyType: string;
   ip: string;
@@ -151,7 +153,19 @@ export class ConnectionPool {
         fingerprint,
       });
     }
-    return this.store.confirmHostKey({ ip, port: endpoint.port }, fingerprint);
+    return this.store.confirmHostKey({ ip, port: endpoint.port }, fingerprint, {
+      expectedFingerprint: observation.configuredFingerprint,
+      validateObservation: () => {
+        if (this.disposed) throw new LiteSshError('SERVER_STOPPING', 'The connection pool is shutting down.');
+        const current = this.observed.get(key);
+        if (!current || current.fingerprint !== observation.fingerprint || current.keyType !== observation.keyType) {
+          throw new LiteSshError('HOST_KEY_MISMATCH', 'The observed host key changed while confirmation was pending. Observe and confirm the current key again.', {
+            ip, port: endpoint.port, fingerprint,
+            ...(current ? { keyType: current.keyType, expectedFingerprint: current.fingerprint } : {}),
+          });
+        }
+      },
+    });
   }
 
   /** Close every owned connection and refuse further acquisitions. */
@@ -206,7 +220,7 @@ export class ConnectionPool {
         rejection = new LiteSshError('HOST_KEY_UNTRUSTED', 'The server host key could not be read.', { ip, port, keyType: 'unknown', fingerprint: '' });
         return false;
       }
-      this.observed.set(endpointKey({ ip, port }), { ip, port, keyType: details.keyType, fingerprint: details.fingerprint });
+      this.observed.set(endpointKey({ ip, port }), { ip, port, keyType: details.keyType, fingerprint: details.fingerprint, configuredFingerprint: resolved.hostKeyFingerprint });
       if (resolved.hostKeyFingerprint === undefined) {
         rejection = new LiteSshError('HOST_KEY_UNTRUSTED', 'The server host key is not confirmed for this endpoint.', {
           ip,
@@ -233,8 +247,8 @@ export class ConnectionPool {
     if (resolved.auth.type === 'password') {
       config.password = resolved.auth.password;
     } else {
-      // The selected private key is read only here: after this login request and
-      // after the host-key pin has been checked during the handshake.
+      // Load only this requested login's key, internally. ssh2 still cannot
+      // send user authentication until hostVerifier accepts the server key.
       config.privateKey = await this.loadPrivateKey(resolved.auth.privateKeyPath);
       if (resolved.auth.passphrase !== undefined) config.passphrase = resolved.auth.passphrase;
     }

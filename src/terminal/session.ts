@@ -25,7 +25,7 @@ export interface SessionOptions {
 }
 
 /**
- * One shell input cycle: the readable cache range for a single submitted line.
+ * One real shell input cycle; a compound/quoted command can span several Enters.
  *
  * A cycle exists from either an actual byte handoff or a trusted BEGIN and
  * closes on the single trusted END that belongs to it. It is
@@ -37,8 +37,9 @@ export interface SessionOptions {
  *
  * A PRIVATE, unpublished candidate cycle is kept open after every trusted END
  * so the next prompt/echo/error output already has a readable home before the
- * next submission is handed off. An idle candidate is never published, so a
- * prompt-only END cannot fabricate a round or a result.
+ * next submission is handed off. An idle candidate is not an execution claim:
+ * a trusted END can retain a factual non-executing completion, but no waiter
+ * may claim it without a valid, unambiguous ownership credit.
  */
 interface Cycle {
   id: string;
@@ -75,19 +76,25 @@ export class TerminalSession {
   /** The single open cache round/candidate; see {@link Cycle}. */
   private cycle?: Cycle;
   /**
-   * Submitted-but-not-yet-owned shell lines. A submission is only queued while
-   * NO foreground command is running, because bytes sent to a running program's
-   * stdin are consumed by that program rather than read as a new shell line.
-   * Each trusted END hands the next queued token to its successor cycle.
+   * At most one conservative ownership credit per active write, only while no
+   * foreground command is running. Queued bytes are not predicted shell cycles:
+   * a trusted BEGIN/END must claim the next credit. Expired observers remove
+   * unused credits, so a continuation cannot leak ownership to a later call.
    */
   private pendingTokens: number[] = [];
-  /** Monotonic per-write submission token; a batch owns every cycle it creates. */
+  /** Monotonic per-write credit; only real markers can establish a claimable cycle. */
   private submissionCounter = 0;
   private lastResult?: RoundResult;
-  /** `eventSequence` when the END behind {@link lastResult} was observed. */
-  private lastResultSeq = 0;
-  /** Submission token that owned the cycle behind {@link lastResult}, if any. */
-  private lastResultToken?: number;
+  /** Only active tool observers retain owner results: at most 64 per PTY. */
+  private readonly waitingOwners = new Set<number>();
+  private readonly ownerResults = new Map<number, { result: RoundResult; sequence: number }>();
+  private activeWrites = 0;
+  /** Batch origin survives observer expiry; expiry is not an all-input ACK. */
+  private batchOwner?: number;
+  /** Once boundaries mix, this PTY keeps factual rounds but never guesses ownership. */
+  private ownershipAmbiguous = false;
+  /** Closed waiters may inspect the final parsed screen after emulator disposal. */
+  private finalScreen?: ScreenSnapshot;
   private closePromise?: Promise<Record<string, unknown>>;
   private initialized = false;
 
@@ -108,9 +115,9 @@ export class TerminalSession {
       },
       // Protocol replies must not wait behind a tool's remote-output waiter.
       onReply: data => {
-        if (this.channel?.writable && this.status !== 'closing' && this.status !== 'closed') {
-          this.channel.write(data, (error?: Error | null) => { if (error) this.fail(error, 'TERMINAL_WRITE_FAILED'); });
-        }
+        if (this.failure || this.status === 'closing' || this.status === 'closed') return;
+        try { this.enqueueInput(data); }
+        catch (error) { this.fail(error, 'TERMINAL_WRITE_FAILED'); }
       }
     });
   }
@@ -243,6 +250,9 @@ export class TerminalSession {
       this.fail(new LiteSshError('SHELL_INTEGRATION_LOST', 'A second BEGIN arrived before the previous round ended.'), 'SHELL_INTEGRATION_LOST');
       return;
     }
+    // A queued owner is claimed only by a real shell boundary, not by the
+    // number of Enter bytes in a prior input packet.
+    this.assignPendingToken();
     cycle.started = true;
     cycle.published = true;
     // Separate the trusted command output from any pre-execution echo already
@@ -277,6 +287,7 @@ export class TerminalSession {
       this.prepareNextCycle();
       return;
     }
+    this.assignPendingToken(); // A genuine END-only cycle can claim a queued owner.
     this.cycle = undefined;
     const completion = this.recorder.endRound(exitCode);
     const started = cycle.started;
@@ -290,29 +301,26 @@ export class TerminalSession {
         // writer-owner gate in `write()` still stops any writer from claiming
         // a completion it did not submit.
         this.lastResult = { ...result, commandStarted: started };
-        this.lastResultSeq = observedSeq;
-        this.lastResultToken = cycle.owner;
+        if (cycle.owner !== undefined && this.waitingOwners.has(cycle.owner)) {
+          this.ownerResults.set(cycle.owner, { result: this.lastResult, sequence: observedSeq });
+        }
         this.notify();
       }
     }).catch(error => this.fail(error, 'CACHE_WRITE_FAILED'));
   }
 
-  /**
-   * Open the next PRIVATE candidate and hand it the next queued submission
-   * token, if any. A token-owning candidate is published so its END is reported
-   * even with no BEGIN (a parser error); an idle candidate stays private and can
-   * never surface as a round or a result.
-   */
+  /** Future input is not a shell cycle until a real BEGIN/END claims it. */
   private prepareNextCycle(): void {
     this.cycle = this.openCycle();
-    this.assignPendingToken();
   }
 
   /** Give the open, unstarted, unowned cycle the next queued submission token. */
   private assignPendingToken(): void {
+    if (this.ownershipAmbiguous) return; // Expired queued credits cannot migrate to another waiter.
     const cycle = this.cycle;
     if (!cycle || cycle.started || cycle.owner !== undefined) return;
-    const token = this.pendingTokens.shift();
+    const token = this.pendingTokens.shift() ??
+      (this.batchOwner !== undefined && this.waitingOwners.has(this.batchOwner) ? this.batchOwner : undefined);
     if (token === undefined) return;
     cycle.owner = token;
     cycle.published = true;
@@ -327,10 +335,38 @@ export class TerminalSession {
    * attribute a completion to the writer that actually submitted it).
    */
   private handoff(submissions: number): number | undefined {
+    if (this.ownershipAmbiguous) return undefined;
+    const unresolvedBatch = this.batchOwner;
+    this.batchOwner = undefined;
+    if (unresolvedBatch !== undefined) {
+      this.ownershipAmbiguous = true;
+      // Remaining bytes of A's multi-submit packet can still produce A2 after
+      // B arrives. Neither Enter counts nor FIFO credits can identify that
+      // boundary as B: invalidate future attribution, retain factual rounds.
+      this.waitingOwners.delete(unresolvedBatch);
+      if (this.cycle?.owner === unresolvedBatch) this.cycle.owner = undefined;
+      for (const pending of this.pendingTokens) this.waitingOwners.delete(pending);
+      this.pendingTokens = [];
+      return undefined;
+    }
+    if (this.cycle && !this.cycle.published && this.pendingTokens.length > 0) {
+      this.ownershipAmbiguous = true;
+      // Earlier overlapping writes might have been continuation fragments, not
+      // additional commands. A new packet across this private boundary makes
+      // ownership ambiguous: keep factual ENDs but do not credit any waiter.
+      for (const pending of this.pendingTokens) this.waitingOwners.delete(pending);
+      this.pendingTokens = [];
+      return undefined;
+    }
     if (submissions <= 0) return undefined;
     if (this.cycle?.started) return undefined; // Bytes go to the running program's stdin.
     const token = (this.submissionCounter += 1);
-    for (let line = 0; line < submissions; line += 1) this.pendingTokens.push(token);
+    // Several Enters can belong to one quote/loop/continuation. A write offers
+    // one conservative ownership credit; only trusted shell markers create
+    // later factual cycles. Never manufacture credits from shell grammar.
+    this.pendingTokens.push(token);
+    this.waitingOwners.add(token);
+    if (submissions > 1) this.batchOwner = token;
     // The re-encode can turn non-submitting bytes into submitting ones (a keypad
     // ENTER whose application mode was switched off during the flush), so make
     // sure a cycle exists to own this submission before assigning the token.
@@ -371,19 +407,46 @@ export class TerminalSession {
     return promise;
   }
 
-  private send(data: string): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      if (!this.channel?.writable || this.channel.destroyed) { reject(new LiteSshError('TERMINAL_CLOSED', 'The PTY is not writable.')); return; }
-      this.channel.write(data, (error?: Error | null) => error ? reject(new LiteSshError('TERMINAL_WRITE_FAILED', 'Input transmission failed; it has not been replayed.')) : resolve());
+  private checkInputBudget(data: string): void {
+    if (this.status === 'closing' || this.status === 'closed' || !this.channel?.writable || this.channel.destroyed) {
+      throw new LiteSshError('TERMINAL_CLOSED', 'The PTY is not writable.');
+    }
+    // Native Writable length includes the currently retained ssh2 callback and
+    // every queued packet. Tool input and DA/DSR replies share this byte credit.
+    if (this.channel.writableLength + Buffer.byteLength(data, 'utf8') > 256 * 1024) {
+      throw new LiteSshError('RESOURCE_LIMIT', 'The PTY outgoing queue reached its 256 KiB budget; input has not been replayed.');
+    }
+  }
+
+  private enqueueInput(data: string): void {
+    this.checkInputBudget(data);
+    let returned = false;
+    let synchronousFailure: LiteSshError | undefined;
+    this.channel!.write(data, (error?: Error | null) => {
+      if (!error) return;
+      const failure = new LiteSshError('TERMINAL_WRITE_FAILED', 'Input transmission failed; it has not been replayed.');
+      if (!returned) synchronousFailure = failure;
+      else if (this.status !== 'closed' && this.status !== 'closing') this.fail(failure, 'TERMINAL_WRITE_FAILED');
     });
+    returned = true;
+    if (synchronousFailure) throw synchronousFailure;
+  }
+
+  private async send(data: string): Promise<void> {
+    // Accepted by the native FIFO is the handoff, NOT a remote processing ACK.
+    // ssh2 can retain its callback forever under window backpressure. Waiting
+    // for it here would block both the observation deadline and owned close.
+    this.enqueueInput(data);
   }
 
   private current(): Record<string, unknown> {
     return {
-      ok: !this.failure, state: this.failure ? 'error' : this.status,
+      ok: !this.failure, state: this.status === 'closed' ? 'closed' : this.failure ? 'error' : this.status,
       terminal: { ...this.identity }, cachePath: this.recorder.path,
       currentRound: this.activeRound() ?? null, lastCompletedRound: this.lastResult ?? null,
-      screen: this.screen.snapshot(), ...(this.failure ? { code: this.failure.code, message: this.failure.message, cacheMayBeIncomplete: true } : {})
+      ...(this.ownershipAmbiguous ? { completionOwnership: 'unknown' } : {}),
+      screen: this.finalScreen ?? this.screen.snapshot(),
+      ...(this.failure ? { code: this.failure.code, message: this.failure.message, cacheMayBeIncomplete: true } : {})
     };
   }
   async read(): Promise<Record<string, unknown>> {
@@ -395,9 +458,11 @@ export class TerminalSession {
 
   async write(actions: InputAction[]): Promise<Record<string, unknown>> {
     if (!actions.length || actions.length > 64) throw new LiteSshError('INVALID_ACTIONS', 'Provide 1 through 64 input actions.');
+    if (this.activeWrites >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 active-input-observer budget.');
     // Set inside the send transaction, before `sent` flips; the initial value is
     // never observed because the listener ignores events until `sent` is true.
     let observeScreenChange = true;
+    let ambiguousBatch = false;
     let initialRevision = this.screen.snapshot().revision;
     let initialSequence = this.eventSequence;
     let sent = false;
@@ -406,17 +471,19 @@ export class TerminalSession {
     let token: number | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let listener: (() => void) | undefined;
+    this.activeWrites++;
     const observation = new Promise<'event' | 'deadline'>(resolve => {
       listener = (): void => {
         if (!sent) return;
-        const snapshot = this.screen.snapshot();
         if (this.failure || this.status !== 'open') { resolve('event'); return; }
-        // A result only counts when no published round is open, it belongs to
-        // THIS write's submission, and its END was observed after the bytes
-        // were handed to the shell. This keeps a stale completion, or a later
-        // overlapping writer's completion, out of the reply.
-        if (this.activeRound() === undefined && token !== undefined && this.lastResult &&
-            this.lastResultToken === token && this.lastResultSeq >= baseline) { resolve('event'); return; }
+        const snapshot = this.screen.snapshot();
+        // Each active observer owns its completion independently. R1 remains
+        // claimable even if R2 has started or overwritten the factual last result.
+        const owned = token === undefined ? undefined : this.ownerResults.get(token);
+        // A multi-Enter packet may be one compound command or several lines.
+        // Keep observing within the existing deadline; return only real ENDs,
+        // never infer that all queued actions were consumed from an Enter count.
+        if (!ambiguousBatch && owned && owned.sequence >= baseline) { resolve('event'); return; }
         if (observeScreenChange && snapshot.revision > initialRevision) { resolve('event'); return; }
         if (snapshot.buffer === 'alternate' && snapshot.revision > initialRevision) resolve('event');
       };
@@ -442,9 +509,12 @@ export class TerminalSession {
         // was pending, so the bytes actually sent must match the mode at send
         // time. A paste whose bracketed mode was lost is rejected here, before
         // anything leaves for the shell.
+        if (this.status !== 'open' || this.failure) throw this.failure ?? new LiteSshError('TERMINAL_CLOSED', 'The terminal stopped before handoff.');
         const { packet, submissions } = encodeBatch(actions, this.screen.snapshot());
         if (Buffer.byteLength(packet, 'utf8') > 65_536) throw new LiteSshError('RESOURCE_LIMIT', 'This input batch exceeds the M0 64 KiB transport budget.');
+        this.checkInputBudget(packet); // Reject before publishing an unsent round.
         observeScreenChange = this.activeRound() !== undefined || submissions === 0;
+        ambiguousBatch = submissions > 1;
         token = this.handoff(submissions);
         this.recorder.recordStep(actions);
         // Events observed while waiting for the send queue are not post-input observations.
@@ -464,19 +534,41 @@ export class TerminalSession {
       await this.output.drain();
       await this.roundWrites.drain();
       await this.recorder.flush();
-      if (this.failure) return { ...this.current(), inputSent: true, inputHandled: 'unknown' };
-      if (this.activeRound() === undefined && token !== undefined && this.lastResult &&
-          this.lastResultToken === token && this.lastResultSeq >= baseline) {
-        return { ok: true, state: this.lastResult.commandStarted === false ? 'shell_input_finished' : 'command_completed', terminal: { ...this.identity }, cachePath: this.recorder.path, ...this.lastResult, inputSent: true,
-          ...(this.lastResult.commandStarted === false ? { message: 'The shell finished handling submitted input without starting a foreground command. Consult exitCode and readable diagnostics.' } : {}),
-          ...(this.lastResult.outputOmitted ? { message: 'Output exceeds 1000 Unicode code points. Use local file tools on cachePath within the returned round markers.' } : {}) };
+      if (this.status === 'closing' && this.closePromise) await this.closePromise;
+      if (this.failure || this.status !== 'open') return { ...this.current(), inputSent: true, inputHandled: 'unknown' };
+      const owned = token === undefined ? undefined : this.ownerResults.get(token);
+      if (owned && owned.sequence >= baseline) {
+        const result = owned.result;
+        return { ok: true, state: result.commandStarted === false ? 'shell_input_finished' : 'command_completed', terminal: { ...this.identity }, cachePath: this.recorder.path, ...result, inputSent: true, inputHandled: 'unknown',
+          ...(result.commandStarted === false ? { message: 'The shell finished handling submitted input without starting a foreground command. Consult exitCode and readable diagnostics.' } : {}),
+          ...(result.outputOmitted ? { message: 'Output exceeds 1000 Unicode code points. Use local file tools on cachePath within the returned round markers.' } : {}) };
       }
       return {
         ...this.current(), state: reason === 'deadline' ? 'pending' : 'screen_updated', inputSent: true, inputHandled: 'unknown',
         observationChanged: this.eventSequence > initialSequence,
         message: 'Observed state is not proof that every key was handled. Read the current screen; do not automatically replay input.'
       };
+    } catch (error) {
+      if (!sent) throw error;
+      // A post-handoff disk/transport failure must not erase the known effect.
+      // Never replay: queue acceptance proves neither delivery nor key handling.
+      this.fail(error, 'CACHE_WRITE_FAILED');
+      return { ...this.current(), inputSent: true, inputHandled: 'unknown', cacheMayBeIncomplete: true };
     } finally {
+      this.activeWrites--;
+      if (token !== undefined) {
+        // An expired, still-unclaimed credit must not become a future caller's
+        // round. Preserve uncertainty rather than silently declaring input drained.
+        if (this.pendingTokens.includes(token) ||
+            (this.cycle?.owner === token && !this.cycle.started && !this.ownerResults.has(token))) {
+          this.ownershipAmbiguous = true;
+        }
+        this.waitingOwners.delete(token);
+        this.ownerResults.delete(token);
+        this.pendingTokens = this.pendingTokens.filter(pending => pending !== token);
+        // batchOwner is a single bounded origin token, retained after expiry;
+        // only a fresh PTY can prove a clean boundary after ambiguous mixing.
+      }
       if (timer) clearTimeout(timer);
       if (listener) this.events.off('change', listener);
     }
@@ -516,6 +608,7 @@ export class TerminalSession {
     let cleanup: { cacheRemoved: boolean; cleanupError?: string };
     try { cleanup = await this.recorder.close(); }
     finally {
+      this.finalScreen = this.screen.snapshot();
       this.screen.dispose();
       await this.lease.release();
       this.status = 'closed';

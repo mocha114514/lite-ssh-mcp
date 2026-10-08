@@ -115,12 +115,24 @@ interface CaptureCursor {
    * across arbitrary eviction.
    */
   emittedSeq: number;
-  /** UTF-16 units of row {@link emittedSeq} already emitted (partial-row dedup). */
-  emittedChars: number;
+  /** Bounded readable row prefix; detects implicit overwrite after reflow. */
+  emittedText: string;
 }
 
 function newCursor(): CaptureCursor {
-  return { emittedSeq: -1, emittedChars: 0 };
+  return { emittedSeq: -1, emittedText: '' };
+}
+
+/** Do not split a newly changed surrogate pair at a shared high surrogate. */
+function commonReadablePrefix(previous: string, current: string): number {
+  let index = 0;
+  const limit = Math.min(previous.length, current.length);
+  while (index < limit && previous.charCodeAt(index) === current.charCodeAt(index)) index++;
+  if (index > 0) {
+    const last = current.charCodeAt(index - 1);
+    if (last >= 0xd800 && last <= 0xdbff) index--;
+  }
+  return index;
 }
 
 export class ScreenModel {
@@ -146,9 +158,8 @@ export class ScreenModel {
   private readonly evictBaseScrolled: Record<BufferType, number> = { normal: 0, alternate: 0 };
   private readonly evictBaseLength: Record<BufferType, number> = { normal: 0, alternate: 0 };
   /**
-   * A lone CR at the end of a write is held back, because whether it is a
-   * destructive CR or the first half of a CRLF depends on the next byte, which
-   * may arrive in a later chunk.
+   * A trailing CR is applied immediately. Only deciding whether its history
+   * boundary is a CRLF or an overwrite waits for the next received byte.
    */
   private pendingCr = false;
   /**
@@ -196,6 +207,23 @@ export class ScreenModel {
       altScreenSwitch('l'),
       eraseCapture('J'),
       eraseCapture('K'),
+      // Cursor addressing can replace cells without CR/BS or erase. Preserve
+      // the chronological text/styles before xterm moves the write position.
+      ...['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'f', 'd', 'L', 'M', 'S', 'T'].map(final =>
+        this.terminal.parser.registerCsiHandler({ final }, () => {
+          this.flushLine();
+          this.onFrame?.(this.buildSnapshot(), 'cursor-address');
+          this.forgetEmitted(this.terminal.buffer.active);
+          return false;
+        })),
+      this.terminal.buffer.onBufferChange(buffer => {
+        if (buffer.type !== 'alternate') return;
+        // The alternate buffer is allocated on its first activation, not at
+        // construction. Its actual populated length is the eviction baseline.
+        this.evictBaseScrolled.alternate = this.scrolled.alternate;
+        this.evictBaseLength.alternate = buffer.length;
+        this.cursors.alternate = newCursor();
+      }),
       this.terminal.onData((data) => {
         // Terminal-generated replies (DA1, DSR, ...) must not block parsing.
         this.onReply?.(data);
@@ -224,18 +252,16 @@ export class ScreenModel {
    */
   async write(data: string | Uint8Array): Promise<ScreenSnapshot> {
     this.assertLive();
-    // Re-attach a CR held back from the previous chunk so a CRLF split across
-    // writes is never mistaken for a destructive lone CR.
-    let input: string | Uint8Array = data;
-    if (this.pendingCr) {
-      this.pendingCr = false;
-      input = typeof input === 'string' ? '\r' + input : prependByte(input, C0_CR);
-    }
-    // Hold back a trailing CR until the next chunk reveals whether LF follows.
-    const trailing = takeTrailingCr(input);
-    this.pendingCr = trailing.pending;
-    const body = trailing.body;
+    // A trailing CR was already applied to the emulator. Only its history
+    // classification waits: CRLF is one hard newline, a lone CR may overwrite.
     let destructive = false;
+    if (this.pendingCr && data.length > 0) {
+      this.pendingCr = false;
+      const first = typeof data === 'string' ? data.charCodeAt(0) : data[0];
+      if (first !== C0_LF) { this.flushBeforeOverwrite(); destructive = true; }
+    }
+    const trailing = takeTrailingCr(data);
+    const body = trailing.body;
     for (const part of splitAtDestructive(body)) {
       if (startsDestructive(part)) {
         this.flushBeforeOverwrite();
@@ -244,15 +270,32 @@ export class ScreenModel {
       await this.writeChunk(part);
     }
     if (destructive) this.flushLine();
-    // Any spurious switch scrolls belong to this chunk's parsing, now finished.
+    if (trailing.pending) {
+      await this.writeChunk(typeof data === 'string' ? '\r' : new Uint8Array([C0_CR]));
+      this.pendingCr = true;
+    }
     this.pendingSwitchScrolls = 0;
     return this.refresh();
   }
 
   /** Writes one already-split chunk and resolves when xterm has parsed it. */
   private writeChunk(data: string | Uint8Array): Promise<void> {
-    return new Promise<void>((resolve) => {
-      this.terminal.write(data, () => resolve());
+    const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+    if (bytes.length === 0) return Promise.resolve();
+    // Queue bounded pieces together, rather than awaiting one timer per glyph.
+    // xterm invokes each callback after that piece is parsed, before the next
+    // piece; this exposes alternate rows BEFORE its no-scrollback buffer trims.
+    const size = Math.max(1, this.terminal.cols);
+    return new Promise<void>((resolve, reject) => {
+      for (let offset = 0; offset < bytes.length; offset += size) {
+        const end = Math.min(offset + size, bytes.length);
+        this.terminal.write(bytes.subarray(offset, end), () => {
+          try {
+            if (this.terminal.buffer.active.type === 'alternate') this.flushLine();
+            if (end === bytes.length) resolve();
+          } catch (error) { reject(error); }
+        });
+      }
     });
   }
 
@@ -265,13 +308,22 @@ export class ScreenModel {
   /** Resizes the local emulator; the main loop mirrors this to the remote PTY. */
   resize(cols: number, rows: number): ScreenSnapshot {
     this.assertLive();
-    // Reflow renumbers rows and can trim; restart eviction counting and dedup.
+    // Capture pending cells and their styled frame before reflow/trim. Seed the
+    // new cursor at the reflowed prefix so later appends do not repeat history.
+    this.flushLine();
+    this.onFrame?.(this.buildSnapshot(), 'before-resize');
     this.terminal.resize(cols, rows);
     for (const type of ['normal', 'alternate'] as const) {
       const buffer = type === 'normal' ? this.terminal.buffer.normal : this.terminal.buffer.alternate;
       this.evictBaseScrolled[type] = this.scrolled[type];
       this.evictBaseLength[type] = buffer.length;
       this.cursors[type] = newCursor();
+      const row = buffer.baseY + buffer.cursorY;
+      const line = buffer.getLine(row);
+      if (line) {
+        this.cursors[type].emittedSeq = row;
+        this.cursors[type].emittedText = readableRow(line, this.terminal.cols, buffer.getNullCell());
+      }
     }
     return this.refresh();
   }
@@ -412,15 +464,19 @@ export class ScreenModel {
     let head = '';
     let tail: string | null = null;
     let seenSeq = -1;
-    let seenChars = 0;
+    let seenText = '';
     for (let row = start; row <= endRow; row += 1) {
       const seq = row + evicted;
       if (seq < cursor.emittedSeq) continue; // Row already emitted in full.
       const line = buffer.getLine(row);
       const text = line ? readableRow(line, this.terminal.cols, nullCell) : '';
-      const chunk = seq === cursor.emittedSeq ? text.slice(cursor.emittedChars) : text;
+      // A narrowing resize can clamp the insertion cursor inside old cells.
+      // Length-only dedup would discard their replacement glyph. Compare the
+      // actual readable prefix, keeping unchanged cells but emitting mutations.
+      const prefix = seq === cursor.emittedSeq ? commonReadablePrefix(cursor.emittedText, text) : 0;
+      const chunk = text.slice(prefix);
       seenSeq = seq;
-      seenChars = text.length;
+      seenText = text;
       if (terminating && row === endRow) tail = chunk;
       else head += chunk;
     }
@@ -430,7 +486,7 @@ export class ScreenModel {
       this.forgetEmitted(buffer);
     } else if (seenSeq >= 0) {
       cursor.emittedSeq = seenSeq;
-      cursor.emittedChars = seenChars;
+      cursor.emittedText = seenText;
     }
   }
 
@@ -449,7 +505,7 @@ export class ScreenModel {
   private forgetEmitted(buffer: IBuffer): void {
     const cursor = this.cursors[buffer.type];
     cursor.emittedSeq = -1;
-    cursor.emittedChars = 0;
+    cursor.emittedText = '';
   }
 
   /**
@@ -464,6 +520,7 @@ export class ScreenModel {
    */
   private captureBeforeSwitch(enteringAlternate: boolean): void {
     if (this.disposed) return;
+    if ((this.terminal.buffer.active.type === 'alternate') === enteringAlternate) return;
     this.flushLine();
     this.onFrame?.(this.buildSnapshot(), enteringAlternate ? 'alt-enter' : 'alt-exit');
     this.cursors.alternate = newCursor();
@@ -500,9 +557,10 @@ export class ScreenModel {
   private handleOsc(data: string): boolean {
     if (!data.startsWith(`${MARKER_NAMESPACE};`)) return false;
     const marker = parseMarker(data, this.nonce);
-    if (!marker) return true; // foreign nonce or malformed: consume, no event.
-    // The end marker terminates a round, so surface any pending tail first.
-    if (marker.kind === 'end') this.flushLine();
+    if (!marker) return true;
+    // BEGIN separates pre-execution prompt/echo from the command summary; END
+    // closes it. Flush the visible prefix before either metadata transition.
+    if (marker.kind === 'begin' || marker.kind === 'end') this.flushLine();
     this.onMarker?.(marker);
     return true;
   }
@@ -630,13 +688,6 @@ const C0_LF = 0x0a;
 const C0_CR = 0x0d;
 const C0_BS = 0x08;
 
-/** Prepends one byte to a byte buffer (for re-attaching a held-back CR). */
-function prependByte(data: Uint8Array, byte: number): Uint8Array {
-  const out = new Uint8Array(data.length + 1);
-  out[0] = byte;
-  out.set(data, 1);
-  return out;
-}
 
 /**
  * Separates a trailing lone CR from the rest of the input. Whether that CR is

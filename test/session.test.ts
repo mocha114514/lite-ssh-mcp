@@ -62,11 +62,15 @@ test('a late PTY callback is closed while a different shared-connection terminal
 class ScriptedChannel extends PassThrough {
   readonly stderr = new PassThrough();
   readonly outbound: string[] = [];
+  private blocked = false;
+  private held?: () => void;
+  holdWrites(): void { this.blocked = true; }
+  releaseWrites(): void { this.blocked = false; const held = this.held; this.held = undefined; held?.(); }
   override _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     this.outbound.push(chunk.toString('utf8'));
-    callback();
+    if (this.blocked) this.held = () => callback(); else callback();
   }
-  close(): void { this.end(); this.stderr.end(); this.emit('close'); }
+  close(): void { this.releaseWrites(); this.end(); this.stderr.end(); this.emit('close'); }
 }
 
 /** A recorder over a fake file handle whose next writes can be held open. */
@@ -75,24 +79,37 @@ interface FlushGate {
   /** Make every subsequent handle write wait until {@link release}. */
   hold(): void;
   release(): void;
+  failWrites(): void;
+  contents(): string;
+  readonly handleClosed: boolean;
 }
 
 async function gatedRecorder(identity: TerminalIdentity, path: string): Promise<FlushGate> {
   let gate: Promise<void> | undefined;
   let unblock: (() => void) | undefined;
+  let failed = false;
+  let closed = false;
+  const written: string[] = [];
+  // This isolated fixture supplies an exact owned deletion target; the fake
+  // handle records parsed cache bytes in memory and never touches user files.
+  await fs.writeFile(path, '', { flag: 'wx' });
   const handle = {
-    // Never touches disk; while `gate` is set this models a slow cache flush.
-    write: async (buffer: Buffer, _offset: number, length: number) => {
+    write: async (buffer: Buffer, offset: number, length: number) => {
       if (gate) await gate;
+      if (failed) throw Object.assign(new Error('fixture write failure'), { code: 'EIO' });
+      written.push(buffer.subarray(offset, offset + length).toString('utf8'));
       return { bytesWritten: length, buffer };
     },
-    close: async () => undefined,
+    close: async () => { closed = true; },
   } as unknown as FileHandle;
   const recorder = await ReadableRecorder.createWithHandle(handle, path, identity);
   return {
     recorder,
     hold(): void { gate = new Promise<void>(resolve => { unblock = resolve; }); },
     release(): void { const resolve = unblock; gate = undefined; unblock = undefined; resolve?.(); },
+    failWrites(): void { failed = true; },
+    contents(): string { return written.join(''); },
+    get handleClosed(): boolean { return closed; },
   };
 }
 
@@ -203,7 +220,10 @@ test('two overlapping submissions get one cycle each, the later one END-only', {
     assert.equal(secondResult.exitCode, 2);
     assert.equal(secondResult.commandStarted, false);
     assert.ok(String(secondResult.output).includes('syntax error'));
-    assert.notEqual(firstResult.exitCode, 2, 'the earlier submission must not inherit the later parse error');
+    assert.equal(firstResult.state, 'command_completed', 'the first completion must survive the later END');
+    assert.equal(firstResult.round, 'R1');
+    assert.equal(firstResult.exitCode, 0);
+    assert.ok(String(firstResult.output).includes('short readable output'));
   } finally {
     await session.close().catch(() => undefined);
   }
@@ -272,4 +292,205 @@ test('a mode change during the pre-send flush is honoured at the actual handoff'
   } finally {
     await session.close().catch(() => undefined);
   }
+});
+
+
+// ROUND01 fault regressions use only scripted channels and owned local fixtures.
+test('R01 multiline shell input publishes only actual marked cycles, not every Enter', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r01-multiline');
+  try {
+    const resultPromise = session.write([
+      { type: 'text', text: 'for x in 1; do' }, { type: 'key', key: 'ENTER' },
+      { type: 'text', text: 'printf loop' }, { type: 'key', key: 'ENTER' },
+      { type: 'text', text: 'done' }, { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('done'), 'the multiline packet');
+    feed(channel, 'for x in 1; do\r\n> printf loop\r\n> done\r\n' + marker(nonce, 'BEGIN') + 'loop\r\n' + marker(nonce, 'END;0'));
+    const result = await resultPromise;
+    assert.equal(result.state, 'command_completed');
+    assert.equal(result.round, 'R1');
+    assert.equal((await session.read()).currentRound, null, 'no phantom successor may be published');
+    const next = session.write([{ type: 'text', text: 'next-one' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('next-one'), 'the next packet');
+    feed(channel, marker(nonce, 'BEGIN') + 'next output\r\n' + marker(nonce, 'END;0'));
+    const nextResult = await next;
+    if (nextResult.state === 'command_completed') assert.equal(nextResult.round, 'R2');
+    else assert.equal(nextResult.inputHandled, 'unknown', 'a prior multi-submit packet is not an all-keys ACK');
+    assert.equal(((await session.read()).lastCompletedRound as Record<string, unknown>).round, 'R2');
+  } finally { channel.releaseWrites(); await session.close().catch(() => undefined); }
+});
+
+test('R01 an earlier owner completes while a later marked command is still running', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r01-owner-running');
+  let later: Promise<Record<string, unknown>> | undefined;
+  try {
+    const first = session.write([{ type: 'text', text: 'first-owned' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('first-owned'), 'first handoff');
+    later = session.write([{ type: 'text', text: 'later-owned' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('later-owned'), 'later handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'first output\r\n' + marker(nonce, 'END;0') + marker(nonce, 'BEGIN'));
+    const result = await first;
+    assert.equal(result.state, 'command_completed');
+    assert.equal(result.round, 'R1');
+    assert.equal(result.exitCode, 0);
+    assert.equal((await session.read()).currentRound, 'R2');
+  } finally {
+    feed(channel, 'later output\r\n' + marker(nonce, 'END;2'));
+    await later?.catch(() => undefined);
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('R01 SSH backpressure does not bypass the tool observation deadline', { timeout: 10_000 }, async () => {
+  const { session, channel } = await scriptedSession('r01-send-deadline');
+  let pending: Promise<Record<string, unknown>> | undefined;
+  try {
+    channel.holdWrites();
+    pending = session.write([{ type: 'text', text: 'held-deadline' }, { type: 'key', key: 'ENTER' }]);
+    void pending.catch(() => undefined);
+    await waitFor(() => channel.outbound.join('').includes('held-deadline'), 'held native write');
+    const result = await Promise.race([pending, new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 1000))]);
+    assert.ok(result, 'the native callback must not keep the tool pending forever');
+    assert.equal(result.state, 'pending');
+    assert.equal(result.inputSent, true);
+    assert.equal(result.inputHandled, 'unknown');
+  } finally { channel.releaseWrites(); await pending?.catch(() => undefined); await session.close().catch(() => undefined); }
+});
+
+test('R01 close interrupts a backpressured send and returns owned cleanup facts', { timeout: 10_000 }, async () => {
+  const { session, channel, flush } = await scriptedSession('r01-send-close');
+  let pending: Promise<Record<string, unknown>> | undefined;
+  let closing: Promise<Record<string, unknown>> | undefined;
+  try {
+    channel.holdWrites();
+    pending = session.write([{ type: 'text', text: 'held-close' }, { type: 'key', key: 'ENTER' }]);
+    void pending.catch(() => undefined);
+    await waitFor(() => channel.outbound.join('').includes('held-close'), 'held native write');
+    closing = session.close();
+    const result = await Promise.race([closing, new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 500))]);
+    assert.ok(result, 'owned close must not sit behind a permanently retained write callback');
+    assert.equal(result.cacheRemoved, true);
+    assert.equal(flush.handleClosed, true);
+    const writeResult = await pending;
+    assert.equal(writeResult.inputSent, true);
+    assert.equal(writeResult.state, 'closed');
+  } finally { channel.releaseWrites(); await pending?.catch(() => undefined); await closing?.catch(() => undefined); await session.close().catch(() => undefined); }
+});
+
+test('R01 terminal-query replies share a bounded outgoing byte budget', { timeout: 10_000 }, async () => {
+  const { session, channel } = await scriptedSession('r01-reply-budget');
+  try {
+    channel.holdWrites();
+    feed(channel, '\x1b[5n'.repeat(70_000));
+    const result = await session.read();
+    assert.ok(channel.writableLength <= 256 * 1024, 'query responses must not accumulate unboundedly in ssh2');
+    assert.equal(result.code, 'RESOURCE_LIMIT');
+    assert.equal(result.cacheMayBeIncomplete, true);
+  } finally { channel.releaseWrites(); await session.close().catch(() => undefined); }
+});
+
+test('R01 a cache EIO after handoff retains transmission and integrity context', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce, flush } = await scriptedSession('r01-cache-context');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'cache-failure-command' }, { type: 'key', key: 'ENTER' }])
+      .catch((error): Record<string, unknown> => ({ thrown: error }));
+    await waitFor(() => channel.outbound.join('').includes('cache-failure-command'), 'successful handoff');
+    flush.failWrites();
+    feed(channel, marker(nonce, 'BEGIN') + 'parsed output\r\n' + marker(nonce, 'END;0'));
+    const result = await outcome;
+    assert.equal(result.inputSent, true, 'do not replace a known handed-off packet with a generic error');
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'CACHE_WRITE_FAILED');
+    assert.equal(result.inputHandled, 'unknown');
+    assert.equal(result.cacheMayBeIncomplete, true);
+    assert.ok(result.terminal);
+    assert.equal(result.cachePath, session.recorder.path);
+    assert.equal(channel.outbound.join('').split('cache-failure-command').length - 1, 1, 'no input replay');
+  } finally { await session.close().catch(() => undefined); }
+});
+
+
+test('R01 an overlapping writer cannot claim the older batch\'s second actual round', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r01-mixed-batch');
+  let batch: Promise<Record<string, unknown>> | undefined;
+  try {
+    batch = session.write([
+      { type: 'text', text: 'batch-a1' }, { type: 'key', key: 'ENTER' },
+      { type: 'text', text: 'batch-a2' }, { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('batch-a2'), 'the older batch');
+    const later = session.write([{ type: 'text', text: 'writer-b' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('writer-b'), 'the later writer');
+    feed(channel,
+      marker(nonce, 'BEGIN') + 'A1-only\r\n' + marker(nonce, 'END;3') +
+      marker(nonce, 'BEGIN') + 'A2-only\r\n' + marker(nonce, 'END;7') +
+      marker(nonce, 'BEGIN') + 'B-only\r\n' + marker(nonce, 'END;9'));
+    const result = await later;
+    if (result.state === 'command_completed') {
+      assert.equal(result.round, 'R3', 'B must not inherit A2');
+      assert.equal(result.exitCode, 9);
+      assert.ok(String(result.output).includes('B-only'));
+    } else {
+      assert.equal(result.inputHandled, 'unknown', 'ambiguous ownership must stay explicitly unknown');
+    }
+    await batch;
+    const factual = (await session.read()).lastCompletedRound as Record<string, unknown>;
+    assert.equal(factual.round, 'R3');
+    assert.equal(factual.exitCode, 9);
+  } finally { await batch?.catch(() => undefined); await session.close().catch(() => undefined); }
+});
+
+
+test('R01 expiry of a batch observer cannot transfer its delayed second round to a new writer', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r01-expired-batch');
+  try {
+    const older = session.write([
+      { type: 'text', text: 'delayed-a1' }, { type: 'key', key: 'ENTER' },
+      { type: 'text', text: 'delayed-a2' }, { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('delayed-a2'), 'the older packet');
+    // A preserved prompt hook or delayed input delivery can postpone A2 beyond
+    // this observer's deadline. Its expiry proves nothing about remaining keys.
+    feed(channel, marker(nonce, 'BEGIN') + 'earlier A1\r\n' + marker(nonce, 'END;0'));
+    await older;
+    const later = session.write([{ type: 'text', text: 'delayed-b' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('delayed-b'), 'the new packet');
+    feed(channel,
+      marker(nonce, 'BEGIN') + 'older A2\r\n' + marker(nonce, 'END;7') +
+      marker(nonce, 'BEGIN') + 'new B\r\n' + marker(nonce, 'END;9'));
+    const result = await later;
+    if (result.state === 'command_completed') {
+      assert.equal(result.round, 'R3'); assert.equal(result.exitCode, 9);
+    } else { assert.equal(result.inputHandled, 'unknown'); }
+    assert.equal(((await session.read()).lastCompletedRound as Record<string, unknown>).round, 'R3');
+  } finally { await session.close().catch(() => undefined); }
+});
+
+
+test('R01 a third overlapping packet cannot restore credit in an already ambiguous batch', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r01-third-packet');
+  let first: Promise<Record<string, unknown>> | undefined;
+  let second: Promise<Record<string, unknown>> | undefined;
+  try {
+    first = session.write([
+      { type: 'text', text: 'triple-a1' }, { type: 'key', key: 'ENTER' },
+      { type: 'text', text: 'triple-a2' }, { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('triple-a2'), 'A packet');
+    second = session.write([{ type: 'text', text: 'triple-b' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('triple-b'), 'B packet');
+    const third = session.write([{ type: 'text', text: 'triple-c' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('triple-c'), 'C packet');
+    feed(channel,
+      marker(nonce, 'BEGIN') + 'only A1\r\n' + marker(nonce, 'END;3') +
+      marker(nonce, 'BEGIN') + 'only A2\r\n' + marker(nonce, 'END;7') +
+      marker(nonce, 'BEGIN') + 'only B\r\n' + marker(nonce, 'END;9') +
+      marker(nonce, 'BEGIN') + 'only C\r\n' + marker(nonce, 'END;11'));
+    const result = await third;
+    if (result.state === 'command_completed') {
+      assert.equal(result.round, 'R4'); assert.equal(result.exitCode, 11);
+    } else { assert.equal(result.inputHandled, 'unknown'); }
+    await first; await second;
+    assert.equal(((await session.read()).lastCompletedRound as Record<string, unknown>).round, 'R4');
+  } finally { await first?.catch(() => undefined); await second?.catch(() => undefined); await session.close().catch(() => undefined); }
 });

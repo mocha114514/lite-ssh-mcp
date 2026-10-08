@@ -10,6 +10,7 @@ import type { Server as Ssh2Server } from 'ssh2';
 import { ConfigStore } from '../src/config/store.js';
 import { ConnectionPool } from '../src/ssh/pool.js';
 import { LiteSshError } from '../src/core/errors.js';
+import { endpointKey } from '../src/core/targets.js';
 
 /**
  * A fake loopback SSH server with an in-memory RSA host key. All fixtures live
@@ -256,4 +257,97 @@ test('dispose closes owned connections and refuses further acquisitions', async 
   await pool.dispose();
   await closed;
   await expectCode(pool.acquire(target()), 'CONNECTION_LOST');
+});
+
+
+// These races mutate only generated loopback configuration/observation fixtures.
+const alternateFingerprint = `SHA256:${Buffer.alloc(32, 90).toString('base64').replace(/=+$/, '')}`;
+
+test('R01 a stale approval cannot overwrite another instance\'s newer trust pin', async () => {
+  const file = await writeConfig({ accounts: { [USERNAME]: { auth: { type: 'password', password: PASSWORD } } } });
+  const pool = new ConnectionPool(new ConfigStore(file));
+  try {
+    await expectCode(pool.acquire(target()), 'HOST_KEY_UNTRUSTED');
+    await new ConfigStore(file).confirmHostKey(endpoint(), alternateFingerprint);
+    const before = await fs.readFile(file, 'utf8');
+    await expectCode(pool.confirmHostKey(endpoint(), expectedFingerprint), 'HOST_KEY_MISMATCH');
+    assert.equal(await fs.readFile(file, 'utf8'), before, 'a stale approval must leave the current file byte-identical');
+  } finally { await pool.dispose(); }
+});
+
+test('R01 trust changed while the configuration lock is held is revalidated under that lock', async () => {
+  const file = await writeConfig({ accounts: { [USERNAME]: { auth: { type: 'password', password: PASSWORD } } } });
+  const pool = new ConnectionPool(new ConfigStore(file));
+  const lockPath = `${file}.lock`;
+  let lock: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let approval: Promise<unknown> | undefined;
+  try {
+    await expectCode(pool.acquire(target()), 'HOST_KEY_UNTRUSTED');
+    lock = await fs.open(lockPath, 'wx', 0o600);
+    approval = pool.confirmHostKey(endpoint(), expectedFingerprint);
+    void approval.catch(() => undefined);
+    // This test owns the competing writer's lock, and commits only its own fixture.
+    const document = JSON.parse(await fs.readFile(file, 'utf8'));
+    document.servers['127.0.0.1'][String(port)].hostKeyFingerprint = alternateFingerprint;
+    await fs.writeFile(file, JSON.stringify(document), 'utf8');
+    const before = await fs.readFile(file, 'utf8');
+    await lock.close(); lock = undefined; await fs.unlink(lockPath);
+    await expectCode(approval, 'HOST_KEY_MISMATCH');
+    assert.equal(await fs.readFile(file, 'utf8'), before);
+  } finally {
+    if (lock) { await lock.close(); await fs.unlink(lockPath); }
+    await approval?.catch(() => undefined);
+    await pool.dispose();
+  }
+});
+
+test('R01 a candidate changed during temporary-file sync is rejected before publication', async t => {
+  const file = await writeConfig({ accounts: { [USERNAME]: { auth: { type: 'password', password: PASSWORD } } } });
+  const pool = new ConnectionPool(new ConfigStore(file));
+  try {
+    await expectCode(pool.acquire(target()), 'HOST_KEY_UNTRUSTED');
+    const before = await fs.readFile(file, 'utf8');
+    // Private observation metadata is deliberately controlled here; no real
+    // host key/config is changed and no production-only testing API is added.
+    const observations = (pool as unknown as { observed: Map<string, Record<string, unknown>> }).observed;
+    const key = endpointKey(endpoint());
+    const originalOpen = fs.open.bind(fs);
+    let changed = false;
+    t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]).endsWith('.tmp')) {
+        const originalSync = handle.sync.bind(handle);
+        t.mock.method(handle, 'sync', async () => {
+          observations.set(key, { ...observations.get(key), fingerprint: alternateFingerprint });
+          changed = true;
+          await originalSync();
+        });
+      }
+      return handle;
+    });
+    await expectCode(pool.confirmHostKey(endpoint(), expectedFingerprint), 'HOST_KEY_MISMATCH');
+    assert.equal(changed, true, 'the competing observation happened during sync');
+    assert.equal(await fs.readFile(file, 'utf8'), before);
+    const prefix = `.${path.basename(file)}.`;
+    assert.equal((await fs.readdir(RUN_DIR)).some(name => name.startsWith(prefix) && name.endsWith('.tmp')), false, 'only the owned temporary is cleaned up');
+  } finally { t.mock.restoreAll(); await pool.dispose(); }
+});
+
+
+test('R01 guarded repeat stays idempotent after another endpoint changes', async () => {
+  const file = await writeConfig({ accounts: { [USERNAME]: { auth: { type: 'password', password: PASSWORD } } } });
+  const otherPort = port === 65535 ? port - 1 : port + 1;
+  const document = JSON.parse(await fs.readFile(file, 'utf8'));
+  document.servers['127.0.0.1'][String(otherPort)] = { label: 'independent fixture endpoint', accounts: { another: { auth: { type: 'password', password: 'fixture-other-password' } } } };
+  await fs.writeFile(file, JSON.stringify(document), 'utf8');
+  const pool = new ConnectionPool(new ConfigStore(file));
+  try {
+    await expectCode(pool.acquire(target()), 'HOST_KEY_UNTRUSTED');
+    await pool.confirmHostKey(endpoint(), expectedFingerprint);
+    await new ConfigStore(file).confirmHostKey({ ip: '127.0.0.1', port: otherPort }, alternateFingerprint);
+    const before = await fs.readFile(file, 'utf8');
+    const result = await pool.confirmHostKey(endpoint(), expectedFingerprint);
+    assert.equal(result.changed, false);
+    assert.equal(await fs.readFile(file, 'utf8'), before, 'no rewrite or global-generation false conflict');
+  } finally { await pool.dispose(); }
 });

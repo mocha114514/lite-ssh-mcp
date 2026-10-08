@@ -1,5 +1,5 @@
 import { normalizeIp, validateTerminalTarget } from '../core/targets.js';
-import { LiteSshError } from '../core/errors.js';
+import { LiteSshError, publicError } from '../core/errors.js';
 import type { InputAction, LoginTarget, PageOptions, TerminalIdentity, TerminalTarget } from '../core/types.js';
 import { ConnectionPool } from '../ssh/pool.js';
 import { TerminalSession, type SessionOptions } from './session.js';
@@ -27,7 +27,28 @@ export class TerminalService {
       try {
         entry.session = await TerminalSession.open(lease, identity, this.options);
         return { ...(await entry.session.read()), shellIntegration: 'ready' };
-      } catch (error) { await lease.release(); throw error; }
+      } catch (error) {
+        // If construction succeeded, the session owns the PTY, recorder and
+        // lease. A failure in the first public read must close that whole owner.
+        if (entry.session) {
+          let cleanup: Record<string, unknown>;
+          try { cleanup = await entry.session.close(); }
+          catch (closeError) {
+            // Do not invent a deletion result if owned teardown itself rejected.
+            const code = closeError instanceof LiteSshError ? closeError.code : 'INTERNAL_ERROR';
+            cleanup = { cacheCleanupUnknown: true, cleanupError: `TERMINAL_CLEANUP_FAILED ${code}` };
+          }
+          const { ok: _ok, state: _state, code, message, ...details } = publicError(error);
+          throw new LiteSshError(String(code), String(message), {
+            ...details, terminal: { ...identity }, cachePath: entry.session.recorder.path,
+            ...(typeof cleanup.cacheRemoved === 'boolean' ? { cacheRemoved: cleanup.cacheRemoved } : {}),
+            ...(typeof cleanup.cleanupError === 'string' ? { cleanupError: cleanup.cleanupError } : {}),
+            ...(cleanup.cacheCleanupUnknown === true ? { cacheCleanupUnknown: true } : {}),
+          });
+        }
+        await lease.release();
+        throw error;
+      }
     })();
     this.opening.add(operation);
     try { return await operation; }
@@ -53,6 +74,7 @@ export class TerminalService {
   }
 
   private bind(target: TerminalTarget): TerminalSession {
+    if (this.stopping) throw new LiteSshError('SERVER_STOPPING', 'The MCP instance is shutting down.');
     validateTerminalTarget(target);
     const entry = this.entries.get(target.codename);
     if (!entry || entry.identity.ip !== normalizeIp(target.ip) || entry.identity.port !== target.port) {

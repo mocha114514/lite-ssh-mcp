@@ -161,9 +161,7 @@ export class ReadableRecorder {
     }
 
     const recorder = new ReadableRecorder(handle, chosen, DEFAULT_MAX_PENDING_BYTES);
-    recorder.enqueue(`${terminalHeaderLine(identity, createdAt, instance)}\n`);
-    await recorder.flush(); // Header is durable before any caller can begin a round.
-    return recorder;
+    return recorder.initializeHeader(identity, createdAt, instance);
   }
 
   /**
@@ -179,9 +177,20 @@ export class ReadableRecorder {
     options?: { maxPendingBytes?: number },
   ): Promise<ReadableRecorder> {
     const recorder = new ReadableRecorder(handle, resolve(path), options?.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES);
-    recorder.enqueue(`${terminalHeaderLine(identity, new Date(), 'test')}\n`);
-    await recorder.flush(); // Header is durable before any caller can begin a round.
-    return recorder;
+    return recorder.initializeHeader(identity, new Date(), 'test');
+  }
+
+  /** The factory retains cleanup ownership until its durable header succeeds. */
+  private async initializeHeader(identity: TerminalIdentity, createdAt: Date, instance: string): Promise<ReadableRecorder> {
+    try {
+      this.enqueue(`${terminalHeaderLine(identity, createdAt, instance)}\n`);
+      await this.flush();
+      return this;
+    } catch (error) {
+      const cleanup = await this.close(); // Exact owned path/handle, never a sweep.
+      const failure = error instanceof LiteSshError ? error : new LiteSshError('CACHE_WRITE_FAILED', 'Could not initialize the readable cache header.', { reason: reasonCode(error) });
+      throw new LiteSshError(failure.code, failure.message, { ...failure.details, cachePath: this.path, ...cleanup });
+    }
   }
 
   /** Allocate the next round id (`R1`, `R2`, ...) and open its cache range. */

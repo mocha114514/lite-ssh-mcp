@@ -526,3 +526,27 @@ describe('BoundedWriteQueue failure handling', () => {
     await assert.rejects(settlesWithin(queue.flush()), { code: 'CACHE_WRITE_FAILED' });
   });
 });
+
+
+it('R01 a failed initial cache header closes its handle and removes only its owned file', async () => {
+  const root = caseRoot('r01-header-failure');
+  await mkdir(root, { recursive: true });
+  const owned = join(root, 'owned.context.log');
+  const sibling = join(root, 'sibling.txt');
+  await writeFile(owned, '', { flag: 'wx' });
+  await writeFile(sibling, 'keep sibling\n', { flag: 'wx' });
+  let closed = false;
+  const handle = {
+    write: async () => { throw Object.assign(new Error('fixture header EIO'), { code: 'EIO' }); },
+    close: async () => { closed = true; },
+  } as unknown as FileHandle;
+  try {
+    await assert.rejects(ReadableRecorder.createWithHandle(handle, owned, identity()), error => error instanceof LiteSshError && error.code === 'CACHE_WRITE_FAILED');
+    assert.equal(closed, true, 'the factory is the cleanup owner even before a session exists');
+    assert.equal(existsSync(owned), false);
+    assert.equal(await readFile(sibling, 'utf8'), 'keep sibling\n');
+  } finally {
+    // Rescue only this fixture on the pre-fix baseline; no foreign path is swept.
+    if (existsSync(owned)) await unlink(owned);
+  }
+});

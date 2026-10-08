@@ -13,6 +13,12 @@ import { buildConfigurationView, type ConfigurationView, type LoginEntry } from 
 const LOCK_DEADLINE_MS = 5_000;
 const LOCK_RETRY_MS = 50;
 
+/** Internal trust-observation guard; not a caller-controlled MCP parameter. */
+export interface HostKeyConfirmationGuard {
+  expectedFingerprint: string | undefined;
+  validateObservation(): void;
+}
+
 function defaultConfigPath(): string {
   return path.join(os.homedir(), '.lite-ssh', 'config.json');
 }
@@ -81,7 +87,7 @@ export class ConfigStore {
    * re-read under the lock and a temporary sibling is written with `wx`/0600
    * and renamed over the configuration so readers never observe a partial file.
    */
-  async confirmHostKey(endpoint: Endpoint, fingerprint: string): Promise<{ changed: boolean; fingerprint: string }> {
+  async confirmHostKey(endpoint: Endpoint, fingerprint: string, guard?: HostKeyConfirmationGuard): Promise<{ changed: boolean; fingerprint: string }> {
     const ip = normalizeIp(endpoint.ip);
     const port = endpoint.port;
     endpointKey({ ip, port }); // validate the port range
@@ -104,9 +110,18 @@ export class ConfigStore {
       const servers = raw.servers as JsonObject;
       const portObject = servers[slot.ipRaw] as JsonObject;
       const entry = portObject[slot.portRaw] as JsonObject;
+      guard?.validateObservation();
       if (entry.hostKeyFingerprint === fingerprint) return { changed: false, fingerprint };
+      if (guard && entry.hostKeyFingerprint !== guard.expectedFingerprint) {
+        throw new LiteSshError('HOST_KEY_MISMATCH', 'Endpoint trust changed after this observation. Observe and confirm the current key again.', {
+          ip, port, fingerprint,
+          ...(entry.hostKeyFingerprint !== undefined ? { expectedFingerprint: entry.hostKeyFingerprint } : {}),
+        });
+      }
       entry.hostKeyFingerprint = fingerprint;
-      await atomicWrite(this.filePath, raw);
+      // Async temporary-file writes must not let a newer observation slip past
+      // the earlier check. Revalidate immediately before atomic publication.
+      await atomicWrite(this.filePath, raw, () => guard?.validateObservation());
       return { changed: true, fingerprint };
     } finally {
       await release();
@@ -172,7 +187,7 @@ export class ConfigStore {
   }
 }
 
-async function atomicWrite(filePath: string, value: JsonObject): Promise<void> {
+async function atomicWrite(filePath: string, value: JsonObject, beforeCommit?: () => void): Promise<void> {
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   const temporary = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
@@ -183,6 +198,7 @@ async function atomicWrite(filePath: string, value: JsonObject): Promise<void> {
     await handle.sync();
     await handle.close();
     closed = true;
+    beforeCommit?.();
     await fs.rename(temporary, filePath);
   } catch (error) {
     if (!closed) {

@@ -17,6 +17,59 @@ import { ScreenModel } from '../src/terminal/screen.js';
 
 const NONCE = 'm0-test-nonce';
 
+test('R01 BEGIN flushes pre-execution echo before resetting the command body', async () => {
+  const h = harness(80, 3);
+  try {
+    await h.model.write('prompt$ typed-echo' + encodeMarkerOsc(NONCE, 'BEGIN') + 'OK\r\n' + encodeMarkerOsc(NONCE, 'END;0'));
+    assert.ok(h.events.indexOf('line:prompt$ typed-echo:true') < h.events.indexOf('marker:begin'));
+    assert.deepEqual(h.lines.map(line => line.text), ['prompt$ typed-echo', 'OK']);
+  } finally { h.model.dispose(); }
+});
+
+test('R01 resize preserves partial-line dedup across normal-buffer reflow', async () => {
+  const h = harness(10, 2);
+  try {
+    await h.model.write('01234567890123456789');
+    h.model.flushLine();
+    h.model.resize(30, 3);
+    await h.model.write('XYZ\r\n');
+    assert.equal(h.lines.map(line => line.text).join(''), '01234567890123456789XYZ');
+  } finally { h.model.dispose(); }
+});
+
+test('R01 alternate-buffer wraps retain every glyph before no-scrollback eviction', async () => {
+  const h = harness(10, 3);
+  const payload = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+  try {
+    await h.model.write('\x1b[?1049h' + payload);
+    h.model.flushLine();
+    assert.equal(h.lines.map(line => line.text).join(''), payload);
+  } finally { h.model.dispose(); }
+});
+
+test('R01 a trailing CR moves the cursor now without duplicating a later CRLF', async () => {
+  const h = harness(10, 3);
+  try {
+    const snapshot = await h.model.write('ABCDEF\r');
+    assert.equal(snapshot.cursor.x, 0);
+    await h.model.write('\n');
+    assert.deepEqual(h.lines.map(line => line.text), ['ABCDEF']);
+  } finally { h.model.dispose(); }
+});
+
+test('R01 cursor-addressed TUI overwrites retain ordered styled frames even in one packet', async () => {
+  const frames: ReturnType<ScreenModel['snapshot']>[] = [];
+  const model = new ScreenModel({ nonce: NONCE, cols: 20, rows: 3, onFrame: frame => frames.push(frame) });
+  try {
+    await model.write('\x1b[?1049h\x1b[H\x1b[31mfirst\x1b[H\x1b[32msecond\x1b[?1049l');
+    const first = frames.findIndex(frame => frame.lines.some(line => line.includes('first')));
+    const second = frames.findIndex(frame => frame.lines.some(line => line.includes('second')));
+    assert.ok(first >= 0 && second > first);
+    assert.ok(frames[first]!.styles.length > 0);
+    assert.ok(frames[second]!.styles.length > 0);
+  } finally { model.dispose(); }
+});
+
 interface Harness {
   model: ScreenModel;
   lines: ParsedLine[];
@@ -547,5 +600,28 @@ test('an erase followed by identical glyphs is new readable output', async () =>
     await h.model.write('abc\x1b[2J\x1b[Habc' + encodeMarkerOsc(NONCE, 'END;0'));
     assert.equal(h.lines.map(line => line.text).join(''), 'abcabc');
     assert.equal(h.model.snapshot().lines[0], 'abc');
+  } finally { h.model.dispose(); }
+});
+
+
+test('R01 narrowing resize captures a new glyph that overwrites a clamped cursor cell', async () => {
+  const h = harness(10, 3);
+  try {
+    await h.model.write('0123456789');
+    h.model.resize(5, 3);
+    await h.model.write('X\r\n');
+    assert.ok(h.model.snapshot().lines.some(line => line.includes('X')));
+    assert.ok(h.lines.map(line => line.text).join('').includes('X'), 'newly received X must reach readable history, not only the final screen');
+  } finally { h.model.dispose(); }
+});
+
+test('R01 narrowing into a wide-cell continuation does not drop its replacement glyph', async () => {
+  const h = harness(10, 3);
+  try {
+    await h.model.write('😀');
+    h.model.resize(2, 3);
+    await h.model.write('X\r\n');
+    assert.ok(h.model.snapshot().lines.some(line => line.includes('X')));
+    assert.ok(h.lines.map(line => line.text).join('').includes('X'));
   } finally { h.model.dispose(); }
 });
