@@ -1,0 +1,27 @@
+{
+  "name": "my-lite-ssh-mcp",
+  "version": "0.1.0-m0.1",
+  "private": true,
+  "description": "lite-ssh V2 M0 terminal-core prototype",
+  "type": "module",
+  "bin": { "lite-ssh-mcp": "dist/cli.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build && npm run build:test && node --test dist-test/test/*.test.js",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@xterm/headless": "6.0.0",
+    "ssh2": "1.17.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.4",
+    "@types/ssh2": "1.15.6",
+    "typescript": "7.0.2"
+  }
+}

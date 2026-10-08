@@ -1,0 +1,144 @@
+# lite-ssh · M0 终端核心原型
+
+基于已确认的 lite-ssh V2 设计。当前交付是 **M0：可运行的 stdio MCP 终端核心**，不是完整发布版。
+
+- 已实现：分层配置、主机指纹确认、内部 SSH 连接租约、独立命名 PTY、临时 shell 钩子、字符屏幕/样式、输入编码、可读上下文缓存、8 个 MCP 工具。
+- 后续阶段：独立异步 SFTP、上传/下载冲突与链接规划、传输查询/取消，以及真实 Linux / 三平台 / 发布客户端验证。未注册这些尚未实现的工具。
+- 工程包暂设 `private: true`，未发布 npm，也未确定公开包名或许可证。
+
+## 本地构建与启动
+
+目标环境 Node.js ≥22；当前实测环境是 **Windows、Node 26.6.0**。
+
+```sh
+npm ci --ignore-scripts
+npm run build
+node dist/cli.js --version
+node dist/cli.js
+```
+
+最后一条启动 stdio MCP；stdout 仅用于协议。`--help`、`--version` 在读取配置前返回。
+
+客户端可先直接运行本地构建产物，例如：
+
+```json
+{
+  "mcpServers": {
+    "lite-ssh": {
+      "command": "node",
+      "args": ["D:/Code/MyGitHub/personal/my-lite-ssh-mcp/dist/cli.js"]
+    }
+  }
+}
+```
+
+## 配置
+
+运行时默认读取 `~/.lite-ssh/config.json`。初始化 MCP、列出工具以及 CLI 帮助/版本不会读取登录配置；配置列表或登录操作才会读取。
+
+配置结构为 **IP → 端口 → 实际账号**。`label` 和主机指纹属于端口层，账号只包含认证信息。下面使用文档保留 IP 和占位密码；不是可直接连接的测试服务器。
+
+```json
+{
+  "version": 2,
+  "servers": {
+    "192.0.2.10": {
+      "22": {
+        "label": "development",
+        "accounts": {
+          "deploy": {
+            "auth": {
+              "type": "password",
+              "password": "<由用户配置>"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+私钥认证形状是 `{"type":"privateKey","privateKeyPath":"<用户配置的绝对路径或 ~/ 路径>","passphrase":"<可选>"}`。公开配置列表只返回 ip、port、username；不返回凭据、口令或私钥路径。重复 JSON 键、规范化后重复的 IP/端口和无效版本会被拒绝，不从其他账号兜底。
+
+未知主机的流程：
+
+1. `terminal_open` 在用户认证前观察 SHA256 指纹并返回 `HOST_KEY_UNTRUSTED`。
+2. AI 向用户展示端点、算法和实际指纹；用户核对并确认。
+3. 调用 `lite_ssh_confirm_host_key(ip, port, fingerprint)`，只更新当前配置中已有端口的指纹。
+4. 重试原来的打开操作，再次验证指纹。指纹变化会报告旧/新值，不静默替换。
+
+确认工具只接受本 MCP 实例此前实际观察的候选；配置写入有跨进程独占锁，重新读取后原子替换，保留其他字段。
+
+## 当前 8 个工具
+
+| 工具 | 用途 |
+|---|---|
+| `lite_ssh_list_configurations` | 过滤/分页列出实际登录组合 |
+| `lite_ssh_confirm_host_key` | 登记用户已确认的具体候选指纹 |
+| `lite_ssh_terminal_open` | 使用 ip、port、username、独立 codename 创建终端 |
+| `lite_ssh_terminal_list` | 找回本实例活动/创建中的终端及缓存位置 |
+| `lite_ssh_terminal_write` | 发送 text、paste 或 key 动作并等待事件 |
+| `lite_ssh_terminal_read` | 只读当前字符屏幕、光标、样式及轮次状态 |
+| `lite_ssh_terminal_resize` | 同时调整 PTY 和本地模型尺寸 |
+| `lite_ssh_terminal_close` | 排空接收/解析/写入，关闭资源并删除本终端自己的缓存 |
+
+`codename` 由 AI 单独提供，最多 64 字符，格式如 `build_main`；本实例所有活动名称全局查重，包括 opening 预留。同一账号可以并行打开不同名字；不把用户名充当名称，不自动编号。终端操作使用 ip、port、codename。
+
+没有公开 connect、disconnect、run、list_connections，也没有 history/view/delta 读屏参数。
+
+## 输入、完成与缓存
+
+```json
+{
+  "ip": "192.0.2.10",
+  "port": 22,
+  "codename": "edit_config",
+  "actions": [
+    {"type":"key","key":"ESC"},
+    {"type":"text","text":":w"},
+    {"type":"key","key":"ENTER"}
+  ]
+}
+```
+
+Vim 的 `i`、`:w`、`:q` 是 `text`；正文才用 `paste`。粘贴要求当前 bracketed-paste 模式，且拒绝能提前结束包装的控制字符；不默默退化成可能执行多行命令的普通键入。方向键/小键盘按当前终端模式编码。
+
+- 普通命令只有可信 shell END 标记才能完成，期限或画面刷新不是完成。
+- `pending` / `screen_updated` 的输入效果仍可能未知。程序自刷新也能改变画面；不要自动重放输入。
+- Bash 语法错误可能只发 END、不发 BEGIN。该路径返回 `shell_input_finished`、真实非零退出状态及 `commandStarted:false`，不伪称前台程序已经执行。
+- 完成轮次的正文不超过 **1000 Unicode 码点**时返回正文；超过时返回 R、绝对缓存路径及标记范围。按码点计数，不按 UTF-8 字节、UTF-16 单元或屏幕宽度。
+- 每个活动终端有一个排他创建的可读文件，默认在 `~/.lite-ssh/cache`。文件名中的时间/实例信息只用于内部隔离，不参与公开寻址。
+- 缓存包含 R、S、可见输出、画面、光标和样式；工具调用间的输出也持续记录。**不存原始终端字节流，也不镜像隐藏输入的 text/paste 值。**
+- 缓存会在可信 END 之后预建下一段私有候选 R，接住后续提示符、回显和诊断；因此文件末尾可能有尚未结束的 `[ROUND Rn BEGIN]`。候选不会被当成正在执行的命令。实际提交或可信 BEGIN 才发布当前轮次；真正执行前的回显保留在 `[SHELL COMMAND BEGIN]` 之前，正常结果预览只计执行开始之后的正文。
+- AI 用现有本地文件工具检索历史；文件工具需访问 MCP 所在机器的对应路径。关闭会删除确切的自有文件，删除失败会如实报告，不扫描其他实例。
+
+## M0 边界与验证
+
+本地自动测试使用真实 SSH 协议、内存生成的主机密钥和模拟 shell，未读取实际 SSH 密钥/配置或连接用户服务器。覆盖主机指纹先于认证、同账号连接复用、独立终端、完整多行/软换行缓存、隐藏输入、TUI 切换、终端查询回应、UTF-8/模式/样式、1000 码点边界、磁盘失败与清理，以及 subprocess stdio。
+
+```sh
+npm test
+```
+
+本轮完整构建与自动测试结果：**130 项通过、0 项失败**（Windows / Node 26.6.0）。保留了首轮 81/83 的失败记录及修正后的回归记录；这不是三平台或真实 Linux 验证结果。
+
+测试源码放在 `test/`；所有生成的 fixture、日志和单独验证脚本放在嵌套 `vb-test/m0/`，不纳入 Git。
+
+Bash 原型要求 ≥4.4，保留 PS0、PROMPT_COMMAND 字符串/数组和 DEBUG trap；旧版本明确返回不支持。Zsh/Fish 适配器已实现并做脚本/协议单测，但未在真实 Linux 上执行验证。额外的本机 Git Bash 检查使用 `--noprofile --norc`，不读取用户 rc；其 `/proc/<pid>/comm` 检查不适用于 MSYS，因此未当作 Linux 端到端验证。autoload 形式的 Zsh 特殊 precmd 仍需实际版本验证。
+
+M0 参数：活动终端最多 16、内部连接最多 32；默认 80×24、输入批次最多 64 动作/64 KiB；resize 支持 2–240 列和 2–100 行。可读写入队列有明确容量，磁盘/队列失败返回 `CACHE_WRITE_FAILED`，不宣称历史完整。生产吞吐量、三平台及最低 Node 版本还需后续实测。
+
+## 模块与后续工作
+
+| 目录 | 职责 |
+|---|---|
+| `src/core` | 数据契约、公开错误、寻址与串行队列 |
+| `src/config` | 严格 V2 配置及原子指纹更新 |
+| `src/ssh` | 主机指纹和内部连接租约 |
+| `src/shell` | shell 探测、临时钩子和控制标记协议 |
+| `src/terminal` | 模式输入编码、字符模型、具体 PTY 与名称注册表 |
+| `src/cache` | 完整可读记录、受限预览、写入背压与确切路径清理 |
+| `src/mcp` | 实际工具定义、输入/输出校验及结果格式 |
+
+下一步先做真实 Linux 的 Bash/Zsh/Fish 与 Vim/top 验证，再按 V2 的独立异步 SFTP 阶段实施；传输默认值和业务规则以已确认的 V2 为准，不复制旧稿接口。
