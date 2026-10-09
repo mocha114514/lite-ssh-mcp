@@ -1,51 +1,40 @@
-# lite-ssh · M0 终端核心原型
+# lite-ssh-mcp
 
-基于已确认的 lite-ssh V2 设计。当前交付是 **M0：可运行的 stdio MCP 终端核心**，不是完整发布版。
+[简体中文](README.zh-CN.md)
 
-- 已实现：分层配置、主机指纹确认、内部 SSH 连接租约、独立命名 PTY、临时 shell 钩子、字符屏幕/样式、输入编码、可读上下文缓存、8 个 MCP 工具。
-- 后续阶段：独立异步 SFTP、上传/下载冲突与链接规划、传输查询/取消，以及真实 Linux / 三平台 / 发布客户端验证。未注册这些尚未实现的工具。
-- 工程包暂设 `private: true`，未发布 npm，也未确定公开包名或许可证。
+A lightweight **stdio MCP server for SSH terminals**. Open independent named PTYs, send text, keys or paste, and read parsed screens, styles and shell command status. Each terminal keeps a local readable context log. Shell integration is temporary and does not modify shell startup files.
 
-## 本地构建与启动
+Current scope: SSH terminals. SFTP transfer tools are not implemented.
 
-目标环境 Node.js ≥22；当前实测环境是 **Windows、Node 26.6.0**。
+## Configuration
+
+### Build and connect your MCP client
+
+Requires **Node.js 22+**.
 
 ```sh
 npm ci --ignore-scripts
 npm run build
-node dist/cli.js --version
-node dist/cli.js
 ```
 
-最后一条启动 stdio MCP；stdout 仅用于协议。`--help`、`--version` 在读取配置前返回。
-
-客户端可先直接运行本地构建产物，例如：
+Add the local server to your MCP client (adapt the configuration format for your client):
 
 ```json
 {
   "mcpServers": {
     "lite-ssh": {
       "command": "node",
-      "args": ["D:/Code/MyGitHub/personal/my-lite-ssh-mcp/dist/cli.js"]
+      "args": ["/absolute/path/to/lite-ssh-mcp/dist/cli.js"]
     }
   }
 }
 ```
 
-## 配置
+Replace the script path with your absolute path; use the full path to `node` if it is not on PATH.
 
-运行时配置位置是 `~/.lite-ssh/config.json`。**正常 stdio 启动会自动创建缺失的目录和以下文件**：
+### SSH logins
 
-| 文件 | 初始内容与用途 |
-|---|---|
-| `config.json` | 合法的空 V2 配置：`{"version":2,"servers":{}}`，只读取这份文件作为实际登录配置 |
-| `config.example.json` | 完整的 **2 个 IP × 每个 2 个端口 × 每个端口 2 个账号**示例，共 8 个登录组合；不会作为实际配置读取 |
-
-已有文件保留原样，不覆盖、不自动修复。首次创建先写完自有临时文件，再以排他硬链接发布，避免覆盖并发创建的文件或让其他实例读到半份 JSON；不支持该发布方式或无法创建时，启动在 stderr 报告 `CONFIG_INIT_FAILED` 并退出，不采用不安全的覆盖兜底。新建目录/文件使用 POSIX 0700/0600；Windows 权限遵循文件系统权限规则，不修改已有权限。
-
-把示例中需要的条目填入 `config.json` 的 `servers`，替换 IP、端口、用户名和认证信息即可。同层增加并列条目；不同 IP 可使用相同端口，不同端口可出现相同用户名，同一对象内不能重复键。启动时只初始化缺失文件；**调用配置列表/登录工具时读取当前配置，登录时取得对应账号凭据完成 SSH 认证**，修改认证配置后下一次连接就能读取。CLI `--help` / `--version` 不创建这些文件。
-
-配置结构为 **IP → 端口 → 实际账号**。`label` 和主机指纹属于端口层，账号只包含认证信息。下面是一个登录项的缩略示例，完整多项写法见自动生成的 `config.example.json`。文档保留 IP 和占位密码不是可直接连接的测试服务器。
+On normal startup, the server creates missing `~/.lite-ssh/config.json` (empty) and `config.example.json` files. Existing files are not overwritten. Edit **`config.json`**, using the hierarchy **IP → port → account**:
 
 ```json
 {
@@ -58,7 +47,7 @@ node dist/cli.js
           "deploy": {
             "auth": {
               "type": "password",
-              "password": "<由用户配置>"
+              "password": "<your-password>"
             }
           }
         }
@@ -68,97 +57,35 @@ node dist/cli.js
 }
 ```
 
-私钥认证形状是 `{"type":"privateKey","privateKeyPath":"<用户配置的绝对路径或 ~/ 路径>","passphrase":"<可选>"}`。公开配置列表只返回 ip、port、username；不返回凭据、口令或私钥路径。重复 JSON 键、规范化后重复的 IP/端口和无效版本会被拒绝，不从其他账号兜底。
-
-未知主机的流程：
-
-1. `terminal_open` 在用户认证前观察 SHA256 指纹并返回 `HOST_KEY_UNTRUSTED`。
-2. AI 向用户展示端点、算法和实际指纹；用户核对并确认。
-3. 调用 `lite_ssh_confirm_host_key(ip, port, fingerprint)`，只更新当前配置中已有端口的指纹。
-4. 重试原来的打开操作，再次验证指纹。指纹变化会报告旧/新值，不静默替换。
-
-确认工具只接受本 MCP 实例此前实际观察的候选；配置写入有跨进程独占锁，重新读取后原子替换，保留其他字段。
-
-## 当前 8 个工具
-
-| 工具 | 用途 |
-|---|---|
-| `lite_ssh_list_configurations` | 过滤/分页列出实际登录组合 |
-| `lite_ssh_confirm_host_key` | 登记用户已确认的具体候选指纹 |
-| `lite_ssh_terminal_open` | 使用 ip、port、username、独立 codename 创建终端 |
-| `lite_ssh_terminal_list` | 找回本实例活动/创建中的终端及缓存位置 |
-| `lite_ssh_terminal_write` | 发送 text、paste 或 key 动作并等待事件 |
-| `lite_ssh_terminal_read` | 只读当前字符屏幕、光标、样式及轮次状态 |
-| `lite_ssh_terminal_resize` | 同时调整 PTY 和本地模型尺寸 |
-| `lite_ssh_terminal_close` | 排空接收/解析/写入，关闭资源并删除本终端自己的缓存 |
-
-`codename` 由 AI 单独提供，最多 64 字符，格式如 `build_main`；本实例所有活动名称全局查重，包括 opening 预留。同一账号可以并行打开不同名字；不把用户名充当名称，不自动编号。终端操作使用 ip、port、codename。
-
-没有公开 connect、disconnect、run、list_connections，也没有 history/view/delta 读屏参数。
-
-## 输入、完成与缓存
+Replace the example address, port, account and credentials. For private-key authentication, use this `auth` object; omit `passphrase` for an unencrypted key:
 
 ```json
 {
-  "ip": "192.0.2.10",
-  "port": 22,
-  "codename": "edit_config",
-  "actions": [
-    {"type":"key","key":"ESC"},
-    {"type":"text","text":":w"},
-    {"type":"key","key":"ENTER"}
-  ]
+  "type": "privateKey",
+  "privateKeyPath": "~/.ssh/id_ed25519",
+  "passphrase": "<your-key-passphrase>"
 }
 ```
 
-Vim 的 `i`、`:w`、`:q` 是 `text`；正文才用 `paste`。粘贴要求当前 bracketed-paste 模式，且拒绝能提前结束包装的控制字符；不默默退化成可能执行多行命令的普通键入。方向键/小键盘按当前终端模式编码。
+Keep SSH configuration and credentials local; do not commit them. Unknown or changed host keys stop authentication. Verify the reported SHA256 fingerprint, explicitly confirm it with `lite_ssh_confirm_host_key`, then retry opening the terminal.
 
-- 普通命令只有可信 shell END 标记才能完成，期限或画面刷新不是完成。
-- `pending` / `screen_updated` 的输入效果仍可能未知。程序自刷新也能改变画面；不要自动重放输入。
-- Enter 数量不等于 shell 命令轮数：引号、循环和续行可以共用一个真实 BEGIN/END。并发等待者分别保留自己的已完成结果，不会用后一轮覆盖前一轮。
-- 多次提交的批次与其他输入交错、或未归属的提交观察期限结束后，若无法证明轮次归属，本 PTY 会保守返回 `completionOwnership: "unknown"`，后续 `write` 不再猜测归属。真实轮次仍持续保存在 `read.lastCompletedRound` 和缓存中；如需恢复明确的逐次 write 归属，先保存所需历史，再关闭并新开终端。这个保守边界不是“历史丢失”。
-- `inputSent:true` 表示包已交给 PTY 的有界发送队列，不是远端逐键处理确认。SSH 窗口背压不会让原生 write 回调无限阻塞观察期限或终端关闭；发送后的缓存故障会保留已知发送效果、终端/缓存定位、公开的故障原因与已知丢失计数及完整性警告，绝不自动重放。
-- MCP 请求取消只释放本次观察的名额、监听器和计时器；已交接输入不撤销，不发 Ctrl-C、不重放、不关闭 PTY。尚未交接的排队写入会在交接前检查取消，避免缓存 flush 结束后晚发。观察者与仍保留的输入处理任务分别限额：任务名额覆盖排队发送和观察结束后的解析/记录排空，直到整次处理真正结束，不能靠反复取消绕过容量。取消后仍可只读查询真实轮次。
-- 远端 EOF 会立即禁止新输入并如实报告终端退出，但不会打断已经接收的健康输出/标准错误的解析与记录。真正的解析/缓存写入失败才停止后续解析；若它发生在 EOF 之后，仍保留 `recordingErrorCode`、安全原因和损失计数。不从 EOF 伪造 shell END。
-- Bash 语法错误可能只发 END、不发 BEGIN。该路径返回 `shell_input_finished`、真实非零退出状态及 `commandStarted:false`，不伪称前台程序已经执行。
-- 完成轮次的正文不超过 **1000 Unicode 码点**时返回正文；超过时返回 R、绝对缓存路径及标记范围。按码点计数，不按 UTF-8 字节、UTF-16 单元或屏幕宽度。仅移动光标或只编辑未使用的填充格不会重复计入未变正文，画面/光标/样式仍保留；打印的空格属于正文，真正擦除后重写相同字形则是新的可读输出。RIS 终端复位先保存旧正文/样式帧，再清除旧缓冲区的去重基线，不会把复位后重新打印的字形当成旧输出；原生模式与样式复位仍正常执行。
-- 每个活动终端有一个排他创建的可读文件，默认在 `~/.lite-ssh/cache`。文件名中的时间/实例信息只用于内部隔离，不参与公开寻址。
-- 缓存包含 R、S、可见输出、画面、光标和样式；工具调用间的输出也持续记录。**不存原始终端字节流，也不镜像隐藏输入的 text/paste 值。**
-- 缓存会在可信 END 之后预建下一段私有候选 R，接住后续提示符、回显和诊断；因此文件末尾可能有尚未结束的 `[ROUND Rn BEGIN]`。候选不会被当成正在执行的命令。实际提交或可信 BEGIN 才发布当前轮次；真正执行前的回显保留在 `[SHELL COMMAND BEGIN]` 之前，正常结果预览只计执行开始之后的正文。
-- AI 用现有本地文件工具检索历史；文件工具需访问 MCP 所在机器的对应路径。关闭会删除确切的自有文件，删除失败会如实报告，不扫描其他实例。
+## Tools
 
-## M0 边界与验证
-
-本地自动测试使用真实 SSH 协议、内存生成的主机密钥和模拟 shell，未读取实际 SSH 密钥/配置或连接用户服务器。覆盖主机指纹先于认证、同账号连接复用、独立终端、完整多行/软换行缓存、隐藏输入、TUI 切换、终端查询回应、UTF-8/模式/样式、1000 码点边界、磁盘失败与清理，以及 subprocess stdio。
-
-```sh
-npm test
-```
-
-ROUND 03 修复后的完整构建与自动测试：**211 项通过、0 项失败、0 项跳过**（Windows / Node 26.6.0）。新增 21 项正式回归，覆盖 RIS 复位前的正常/交替画面与样式保存、分片控制序列、新正文与真实预览计数、CR/退格后的无字形变化与真实重写、光标恢复及交替画面往返、交替画面正文捕获的合并/溢出保护与检查点清理，以及观察结束后取消时仍滞留处理任务的容量边界。取消仍只结束观察，保留任务名额直到整次处理真正结束。本轮新代码的真实 VPS 复测需要用户再次手动 Reconnect；构建不会热更新现有 Node 进程。
-
-ROUND 02 的历史完整构建与自动测试：**190 项通过、0 项失败、0 项跳过**，新增 23 项正式回归。其提交 `2fc4774` 已在用户第二次重连后的主实例上验证 5000 行 EOF 完整排空、501 字符光标/空白区编辑预览及真实轮次保留；独立场景矩阵另有通过与未定项。它们只证明该提交及具体场景，不证明本轮新修复或整个 M0 已收敛。
-
-ROUND 01 的历史完整构建与自动测试：**167 项通过、0 项失败、0 项跳过**（Windows / Node 26.6.0）。新增回归覆盖背压/查询回复预算、真实 shell 边界与并发归属、解析/窗口缩放、信任登记竞态及失败清理。这里只代表本地自动测试；新代码的真实 Linux 复测必须在 MCP 重连后进行，不能将旧进程的探索结果当作修复版实测。
-
-首次启动初始化改动后的历史构建与自动测试结果：**142 项通过、0 项失败**（Windows / Node 26.6.0），包含新增的缺失文件创建、2×2×2 示例、现有文件零读取/不覆盖、并发原子发布、失败清理，以及初始化中途停止、CLI/stdio 回归。此前 M0 的 130/130 通过记录，以及首轮 81/83 的失败和修正记录均保留；这不是三平台或真实 Linux 验证结果。
-
-测试源码放在 `test/`；生成的 fixture、日志和单独验证脚本放在嵌套 `vb-test/m0/` 或 `vb-test/vps-audit/`，不纳入 Git。
-
-Bash 原型要求 ≥4.4，保留 PS0、PROMPT_COMMAND 字符串/数组和 DEBUG trap；旧版本明确返回不支持。Zsh/Fish 适配器已实现并做脚本/协议单测，但未在真实 Linux 上执行验证。额外的本机 Git Bash 检查使用 `--noprofile --norc`，不读取用户 rc；其 `/proc/<pid>/comm` 检查不适用于 MSYS，因此未当作 Linux 端到端验证。autoload 形式的 Zsh 特殊 precmd 仍需实际版本验证。
-
-M0 参数：活动终端最多 16、内部连接最多 32；默认 80×24、输入批次最多 64 动作/64 KiB；每 PTY 最多 64 个活动输入观察者和 64 个尚未完成交接的写入任务，两项分别限额；用户输入与终端协议回复共用 256 KiB 原生发送积压预算；resize 支持 2–240 列和 2–100 行。可读写入队列有明确容量，磁盘/队列失败返回 `CACHE_WRITE_FAILED`，不宣称历史完整。退出会先同步关闭八个 MCP 工具的派发入口，再清理确切自有资源；初始化/首次读取失败后的删除失败也会报告保留路径与实际清理结果。生产吞吐量、三平台及最低 Node 版本还需后续实测。
-
-## 模块与后续工作
-
-| 目录 | 职责 |
+| Tool | Purpose |
 |---|---|
-| `src/core` | 数据契约、公开错误、寻址与串行队列 |
-| `src/config` | 严格 V2 配置及原子指纹更新 |
-| `src/ssh` | 主机指纹和内部连接租约 |
-| `src/shell` | shell 探测、临时钩子和控制标记协议 |
-| `src/terminal` | 模式输入编码、字符模型、具体 PTY 与名称注册表 |
-| `src/cache` | 完整可读记录、受限预览、写入背压与确切路径清理 |
-| `src/mcp` | 实际工具定义、输入/输出校验及结果格式 |
+| `lite_ssh_list_configurations` | Filter and paginate configured IP/port/account combinations without exposing credentials. |
+| `lite_ssh_confirm_host_key` | Record a previously observed host fingerprint after user verification and confirmation. |
+| `lite_ssh_terminal_open` | Open a named PTY using a configured login. |
+| `lite_ssh_terminal_list` | List this instance's terminal names, states and local log paths. |
+| `lite_ssh_terminal_write` | Send `text`, `paste` or named `key` actions. Text does not implicitly press Enter; paste requires bracketed-paste mode. |
+| `lite_ssh_terminal_read` | Read the current parsed screen, cursor, styles and command-round state—not historical output. |
+| `lite_ssh_terminal_resize` | Resize the PTY and screen: 2–240 columns, 2–100 rows. |
+| `lite_ssh_terminal_close` | Close the selected PTY and remove its own local context log. |
 
-下一步先在用户重连后复测真实 VPS 的本轮修复，再补齐 Zsh/Fish 与跨平台接入验证；后续按 V2 的独立异步 SFTP 阶段实施。传输默认值和业务规则以已确认的 V2 为准，不复制旧稿接口。
+Opening requires `ip`, `port`, `username` and a unique snake_case `codename`, such as `build_main`. Subsequent terminal operations use `ip`, `port` and `codename`.
+
+Use the returned `cachePath` with local file tools for readable history; save what you need **before closing**. `pending` or `screen_updated` is not a reason to resend input, and a reply is not a per-key acknowledgement. Closing does not guarantee termination of remote background processes.
+
+## License
+
+[MIT](LICENSE) © 2026 mocha114514.

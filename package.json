@@ -2,6 +2,7 @@
   "name": "my-lite-ssh-mcp",
   "version": "0.1.0-m0.1",
   "private": true,
+  "license": "MIT",
   "description": "lite-ssh V2 M0 terminal-core prototype",
   "type": "module",
   "bin": { "lite-ssh-mcp": "dist/cli.js" },
