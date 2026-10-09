@@ -91,9 +91,10 @@ export class TerminalSession {
   private readonly waitingOwners = new Set<number>();
   private readonly ownerResults = new Map<number, { result: RoundResult; sequence: number }>();
   private activeWrites = 0;
-  /** Cancelled observers may leave work behind a blocked flush: cap those
-   * retained action closures separately until their actual handoff task settles. */
-  private retainedHandoffs = 0;
+  /** Cancellation releases observers, not retained work. This credit spans
+   * the awaited send AND post-observation parsing/recording drains, until the
+   * whole write actually settles; neither phase may retain unbounded calls. */
+  private retainedWrites = 0;
   /** Batch origin survives observer expiry; expiry is not an all-input ACK. */
   private batchOwner?: number;
   /** Once boundaries mix, this PTY keeps factual rounds but never guesses ownership. */
@@ -477,7 +478,7 @@ export class TerminalSession {
     if (signal?.aborted) throw new LiteSshError('REQUEST_CANCELLED', 'Observation cancelled before input handoff.', { inputSent: false });
     if (!actions.length || actions.length > 64) throw new LiteSshError('INVALID_ACTIONS', 'Provide 1 through 64 input actions.');
     if (this.activeWrites >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 active-input-observer budget.');
-    if (this.retainedHandoffs >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 retained-input-handoff budget.');
+    if (this.retainedWrites >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 retained-input-work budget.');
     // Set inside the send transaction, before `sent` flips; the initial value is
     // never observed because the listener ignores events until `sent` is true.
     let observeScreenChange = true;
@@ -493,7 +494,7 @@ export class TerminalSession {
     let onAbort: (() => void) | undefined;
     let released = false;
     this.activeWrites++;
-    this.retainedHandoffs++;
+    this.retainedWrites++;
     // Cancellation frees only this observer, never the remote input or PTY.
     // Idempotence covers abort racing ordinary completion and owned close.
     const releaseObserver = (): void => {
@@ -575,7 +576,7 @@ export class TerminalSession {
         }
         sent = true;
         listener?.();
-      }).finally(() => { this.retainedHandoffs--; });
+      });
       const reason = await observation;
       if (reason === 'cancelled') {
         const view = this.current();
@@ -609,6 +610,9 @@ export class TerminalSession {
       return { ...this.current(), inputSent: true, inputHandled: 'unknown', cacheMayBeIncomplete: true };
     } finally {
       releaseObserver();
+      // The send is awaited above, so this also covers cancelled queued sends.
+      // Do not free retained work merely because observation or handoff ended.
+      this.retainedWrites--;
       // batchOwner is a bounded origin retained after cancellation/expiry:
       // neither event proves all queued input was handled.
     }

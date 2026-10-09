@@ -10,6 +10,8 @@ import { LiteSshError } from '../src/core/errors.js';
 import { ReadableRecorder } from '../src/cache/recorder.js';
 import { encodeMarkerOsc } from '../src/shell/protocol.js';
 import { TerminalSession } from '../src/terminal/session.js';
+import { ScreenModel } from '../src/terminal/screen.js';
+import { SerialQueue } from '../src/core/async.js';
 import { createApplication } from '../src/app.js';
 import { startMockSsh } from './helpers/mock-ssh.js';
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
@@ -233,6 +235,84 @@ test('R02 a no-op character erase cannot force a 501-character real preview to b
     assert.equal(result.outputCharacters, 502);
     assert.equal(result.output, 'x'.repeat(501) + '\n');
   } finally { await session.close(); }
+});
+
+test('R03 pre-CR text followed only by RIS cannot omit a genuine 501-character preview', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r03-ris-cr-preview');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r03_ris_cr' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r03_ris_cr\r'), 'RIS CR handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'x'.repeat(501) + '\r\x1bc' + marker(nonce, 'END;0'));
+    const result = await outcome;
+    assert.equal(result.state, 'command_completed');
+    assert.equal(result.outputCharacters, 501);
+    assert.equal(result.outputOmitted, false);
+    assert.equal(result.output, 'x'.repeat(501));
+  } finally { await session.close(); }
+});
+
+test('R03 RIS replacement preserves the real 1003-character preview omission boundary', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('r03-ris-preview');
+  try {
+    const outcome = session.write([{ type: 'text', text: 'r03_ris_command' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.includes('r03_ris_command\r'), 'RIS preview handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'x'.repeat(501) + '\x1b[1C\x1bc' + 'x'.repeat(501) + '\r\n' + marker(nonce, 'END;0'));
+    const result = await outcome;
+    assert.equal(result.state, 'command_completed');
+    assert.equal(result.outputCharacters, 1003);
+    assert.equal(result.outputOmitted, true);
+  } finally { await session.close(); }
+});
+
+test('R03 cancelled post-observation drains retain a bounded whole-input-work credit', { timeout: 10_000 }, async () => {
+  const { session, channel } = await scriptedSession('r03-post-observation', 12);
+  const originalWrite = ScreenModel.prototype.write;
+  const originalDrain = SerialQueue.prototype.drain;
+  let releaseParser!: () => void;
+  const parserGate = new Promise<void>(resolve => { releaseParser = resolve; });
+  let parserEntered = false;
+  let drainEntries = 0;
+  const settled = new Map<number, { code?: string }>();
+  const promises: Promise<unknown>[] = [];
+  // Both gates intercept public methods in this owned test process, not
+  // private Session fields. The cache remains healthy throughout the test.
+  ScreenModel.prototype.write = async function(data) {
+    if (Buffer.from(data).toString('utf8') === 'R03_GATED_OUTPUT') { parserEntered = true; await parserGate; }
+    return originalWrite.call(this, data);
+  };
+  SerialQueue.prototype.drain = async function() { drainEntries++; await originalDrain.call(this); };
+  try {
+    feed(channel, 'R03_GATED_OUTPUT');
+    await waitFor(() => parserEntered, 'parser gate');
+    const before = channel.outbound.length;
+    for (let i = 0; i < 80; i++) {
+      const controller = new AbortController();
+      const previous = drainEntries;
+      const promise = session.write([{ type: 'text', text: '.' }], controller.signal).then(
+        result => { settled.set(i, {}); return result; },
+        error => { settled.set(i, { code: (error as LiteSshError).code }); return error; });
+      promises.push(promise);
+      // Exact drain entry proves that observation has already resolved. An
+      // abort here cannot retroactively win that earlier observation promise.
+      await waitFor(() => drainEntries > previous || settled.has(i), 'post-observation drain or bounded rejection');
+      controller.abort();
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    assert.equal(channel.outbound.length - before, 64);
+    assert.equal(promises.length - settled.size, 64);
+    assert.equal([...settled.values()].filter(value => value.code === 'RESOURCE_LIMIT').length, 16);
+    releaseParser();
+    await Promise.all(promises);
+    const fresh = await session.write([{ type: 'text', text: 'fresh' }]);
+    assert.equal(fresh.inputSent, true);
+    assert.equal(fresh.code, undefined, 'whole-work credits are reusable only after real settlement');
+  } finally {
+    releaseParser();
+    await Promise.all(promises);
+    ScreenModel.prototype.write = originalWrite;
+    SerialQueue.prototype.drain = originalDrain;
+    await session.close();
+  }
 });
 
 test('R02 natural EOF drains every slice of one already-accepted output chunk', { timeout: 10_000 }, async () => {

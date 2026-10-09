@@ -164,6 +164,10 @@ export class ScreenModel {
    * boundary is a CRLF or an overwrite waits for the next received byte.
    */
   private pendingCr = false;
+  /** One bounded readable-state checkpoint per buffer. CR/BS have captured
+   * the old cells, but only a witnessed rewrite invalidates their prefix. */
+  private readonly rewriteCheckpoints: Partial<Record<BufferType, { baseY: number; x: number; y: number; lines: string[] }>> = {};
+  private rewriteControlOnly = false;
   /**
    * Buffer switches make xterm emit a spurious `onScroll` (position 0) that adds
    * no row; counting it would fake an eviction. Each captured switch arms one
@@ -209,10 +213,19 @@ export class ScreenModel {
       altScreenSwitch('l'),
       eraseCapture('J'),
       eraseCapture('K'),
+      this.terminal.parser.registerEscHandler({ final: 'c' }, () => this.captureBeforeReset()),
+      this.terminal.parser.registerEscHandler({ final: '8' }, () => {
+        this.rewriteControlOnly = true;
+        this.flushLine();
+        this.onFrame?.(this.buildSnapshot(), 'cursor-restore');
+        this.preserveAddressedRows(this.terminal.buffer.active);
+        return false;
+      }),
       // Cursor addressing can replace cells without CR/BS or erase. Preserve
       // the chronological text/styles before xterm moves the write position.
-      ...['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'f', 'd', 'L', 'M', 'S', 'T', 'X', 'P', '@'].map(final =>
+      ...['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'f', 'd', 'u', 'L', 'M', 'S', 'T', 'X', 'P', '@'].map(final =>
         this.terminal.parser.registerCsiHandler({ final }, (params) => {
+          this.rewriteControlOnly = true;
           this.flushLine();
           this.onFrame?.(this.buildSnapshot(), 'cursor-address');
           const buffer = this.terminal.buffer.active;
@@ -231,6 +244,7 @@ export class ScreenModel {
         this.evictBaseScrolled.alternate = this.scrolled.alternate;
         this.evictBaseLength.alternate = buffer.length;
         this.cursors.alternate = newCursor();
+        delete this.rewriteCheckpoints.alternate;
       }),
       this.terminal.onData((data) => {
         // Terminal-generated replies (DA1, DSR, ...) must not block parsing.
@@ -275,7 +289,7 @@ export class ScreenModel {
         this.flushBeforeOverwrite();
         destructive = true;
       }
-      await this.writeChunk(part);
+      await this.writeChunk(part, startsDestructive(part));
     }
     if (destructive) this.flushLine();
     if (trailing.pending) {
@@ -287,12 +301,14 @@ export class ScreenModel {
   }
 
   /** Writes one already-split chunk and resolves when xterm has parsed it. */
-  private writeChunk(data: string | Uint8Array): Promise<void> {
+  private writeChunk(data: string | Uint8Array, controlOnly = false): Promise<void> {
     const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
     if (bytes.length === 0) return Promise.resolve();
-    // Queue bounded pieces together, rather than awaiting one timer per glyph.
-    // xterm invokes each callback after that piece is parsed, before the next
-    // piece; this exposes alternate rows BEFORE its no-scrollback buffer trims.
+    // Only a clean CR/BS checkpoint needs native callbacks between bytes.
+    // Ordinary streams and the suffix after a witnessed rewrite stay batched.
+    if (this.rewriteCheckpoints.normal || this.rewriteCheckpoints.alternate) {
+      return this.writeWithRewriteCheckpoint(bytes, controlOnly);
+    }
     const size = Math.max(1, this.terminal.cols);
     return new Promise<void>((resolve, reject) => {
       for (let offset = 0; offset < bytes.length; offset += size) {
@@ -398,7 +414,7 @@ export class ScreenModel {
     if (this.disposed) return;
     const buffer = this.terminal.buffer.active;
     this.captureUpTo(buffer.baseY + buffer.cursorY, false);
-    this.forgetEmitted(buffer);
+    this.rewriteCheckpoints[buffer.type] = this.rewriteState();
   }
 
   /** Releases the emulator and all listeners. Safe to call more than once. */
@@ -515,6 +531,62 @@ export class ScreenModel {
     return Math.max(0, this.evictBaseLength[type] + created - buffer.length);
   }
 
+  private rewriteState(): { baseY: number; x: number; y: number; lines: string[] } {
+    const buffer = this.terminal.buffer.active;
+    return { baseY: buffer.baseY, x: buffer.cursorX, y: buffer.cursorY, lines: this.buildSnapshot().lines };
+  }
+
+  /** Keep the old prefix until a native cursor/cell change witnesses rewriting.
+   * A witness is sticky: restoring the cursor later cannot hide those glyphs.
+   * Public cursor controls update the clean baseline without inventing output. */
+  private async writeWithRewriteCheckpoint(bytes: Uint8Array, controlOnly: boolean): Promise<void> {
+    const captureSize = Math.max(1, this.terminal.cols);
+    for (let offset = 0; offset < bytes.length; offset++) {
+      if (!this.rewriteCheckpoints.normal && !this.rewriteCheckpoints.alternate) {
+        await this.writeChunk(bytes.subarray(offset));
+        return;
+      }
+      this.rewriteControlOnly = controlOnly || bytes[offset]! < 32 || bytes[offset] === 127;
+      await new Promise<void>((resolve, reject) => {
+        this.terminal.write(bytes.subarray(offset, offset + 1), () => {
+          try {
+            const buffer = this.terminal.buffer.active;
+            const before = this.rewriteCheckpoints[buffer.type];
+            if (before) {
+              const after = this.rewriteState();
+              if (this.rewriteControlOnly) this.rewriteCheckpoints[buffer.type] = after;
+              else if (before.baseY !== after.baseY || before.x !== after.x || before.y !== after.y ||
+                  before.lines.length !== after.lines.length || after.lines.some((line, row) => line !== before.lines[row])) {
+                this.forgetEmitted(buffer);
+              }
+            }
+            // Observation bytes are not new body-capture boundaries: the
+            // first rewrite can still leave old suffix cells in this row.
+            // Match the ordinary bounded write pieces, including while a
+            // normal checkpoint remains dormant. Retain pre-eviction capture.
+            if (buffer.type === 'alternate' &&
+                ((offset + 1) % captureSize === 0 || offset + 1 === bytes.length)) this.flushLine();
+            resolve();
+          } catch (error) { reject(error); }
+        });
+      });
+    }
+  }
+
+  /** RIS replaces both native buffers. Capture the outgoing readable state
+   * before reset, then discard prefix identities from those discarded cells.
+   * Returning false preserves xterm's native reset and mode/style handling. */
+  private captureBeforeReset(): boolean {
+    if (this.disposed) return false;
+    this.flushLine();
+    this.onFrame?.(this.buildSnapshot(), 'reset');
+    this.cursors.normal = newCursor();
+    this.cursors.alternate = newCursor();
+    delete this.rewriteCheckpoints.normal;
+    delete this.rewriteCheckpoints.alternate;
+    return false;
+  }
+
   /** ECH changes only its count range; DCH/ICH shift the remaining row. Use
    * public cell occupancy, not trimmed text length or Unicode/column arithmetic. */
   private characterEditTouchesText(buffer: IBuffer, final: string, params: readonly (number | number[])[]): boolean {
@@ -559,6 +631,7 @@ export class ScreenModel {
     cursor.emittedSeq = -1;
     cursor.emittedText = '';
     cursor.addressedRows.clear();
+    delete this.rewriteCheckpoints[buffer.type];
   }
 
   /**
@@ -572,11 +645,16 @@ export class ScreenModel {
    * line is not re-emitted when its command later completes.
    */
   private captureBeforeSwitch(enteringAlternate: boolean): void {
+    this.rewriteControlOnly = true;
     if (this.disposed) return;
     if ((this.terminal.buffer.active.type === 'alternate') === enteringAlternate) return;
     this.flushLine();
     this.onFrame?.(this.buildSnapshot(), enteringAlternate ? 'alt-enter' : 'alt-exit');
     this.cursors.alternate = newCursor();
+    // The outgoing ALT cells are captured above and then discarded. Their
+    // checkpoint must not force future normal output into bytewise parsing;
+    // the normal checkpoint still belongs to its preserved native buffer.
+    delete this.rewriteCheckpoints.alternate;
     this.pendingSwitchScrolls += 1;
   }
 
@@ -770,31 +848,19 @@ function takeTrailingCr(
  * is deliberately left inside its chunk, so `\r\n` still yields exactly one LF.
  */
 function splitAtDestructive(data: string | Uint8Array): Array<string | Uint8Array> {
-  if (typeof data === 'string') {
-    const parts: string[] = [];
-    let start = 0;
-    for (let index = 0; index < data.length; index += 1) {
-      const code = data.charCodeAt(index);
-      const destructive = code === C0_BS || (code === C0_CR && data.charCodeAt(index + 1) !== C0_LF);
-      if (destructive && index > start) {
-        parts.push(data.slice(start, index));
-        start = index;
-      }
-    }
-    parts.push(data.slice(start));
-    return parts;
-  }
-  const parts: Uint8Array[] = [];
+  const parts: Array<string | Uint8Array> = [];
+  const codeAt = (index: number): number | undefined => typeof data === 'string' ? data.charCodeAt(index) : data[index];
   let start = 0;
-  for (let index = 0; index < data.length; index += 1) {
-    const byte = data[index];
-    const destructive = byte === C0_BS || (byte === C0_CR && data[index + 1] !== C0_LF);
-    if (destructive && index > start) {
-      parts.push(data.subarray(start, index));
-      start = index;
-    }
+  for (let index = 0; index < data.length; index++) {
+    const code = codeAt(index);
+    if (code !== C0_BS && !(code === C0_CR && codeAt(index + 1) !== C0_LF)) continue;
+    if (index > start) parts.push(data.slice(start, index));
+    // Classify this control separately, using xterm's actual post-control
+    // coordinates rather than guessing BS/reverse-wrap or CR behaviour.
+    parts.push(data.slice(index, index + 1));
+    start = index + 1;
   }
-  parts.push(data.subarray(start));
+  if (start < data.length || !parts.length) parts.push(data.slice(start));
   return parts;
 }
 

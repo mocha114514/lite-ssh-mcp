@@ -9,6 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import headless from '@xterm/headless';
 
 import { LiteSshError } from '../src/core/errors.js';
 import type { ParsedLine, ShellMarker } from '../src/core/types.js';
@@ -165,6 +166,143 @@ test('R02 printed spaces erased and rewritten are occupied output, not unused pa
     await h.model.write('ABC   \x1b[4G\x1b[3X   \r\n');
     h.model.flushLine();
     assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABC   ABC   \n');
+  } finally { h.model.dispose(); }
+});
+
+for (const split of [false, true]) {
+  test(`R03 RIS discards old normal-row prefixes (${split ? 'split ESC/c' : 'one packet'})`, async () => {
+    const h = harness();
+    try {
+      if (split) {
+        await h.model.write('ABC\r\nABC\x1b[1C\x1b');
+        await h.model.write('cABC\r\n');
+      } else await h.model.write('ABC\r\nABC\x1b[1C\x1bcABC\r\n');
+      h.model.flushLine();
+      assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABC\nABCABC\n');
+    } finally { h.model.dispose(); }
+  });
+}
+
+test('R03 RIS captures the outgoing alternate text and styled frame before native reset', async () => {
+  const lines: ParsedLine[] = [];
+  const frames: { screen: ReturnType<ScreenModel['snapshot']>; label?: string }[] = [];
+  const model = new ScreenModel({ nonce: NONCE, onLine: line => lines.push(line), onMarker: () => {},
+    onFrame: (screen, label) => frames.push({ screen, label }) });
+  try {
+    await model.write('NORMAL\r\n\x1b[?1049h\x1b[31mALT\x1bcAFTER\r\n');
+    model.flushLine();
+    assert.equal(lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'NORMAL\nALTAFTER\n');
+    const resetFrame = frames.find(frame => frame.label === 'reset');
+    assert.equal(resetFrame?.screen.buffer, 'alternate');
+    assert.ok(resetFrame?.screen.styles.length);
+    assert.ok(resetFrame?.screen.lines.some(line => line.includes('ALT')));
+    assert.equal(model.snapshot().buffer, 'normal');
+    assert.equal(model.snapshot().styles.length, 0);
+  } finally { model.dispose(); }
+});
+
+for (const [name, parts] of [
+  ['CR', ['ABC\r\x1bc']],
+  ['BS', ['ABC\b\x1bc']],
+  ['split CR', ['ABC\r', '\x1bc']],
+  ['CR then nonprinting SGR', ['ABC\r\x1b[31m\x1bc']],
+] as const) {
+  test(`R03 RIS does not recapture unchanged text already preserved before ${name}`, async () => {
+    const h = harness();
+    try {
+      for (const part of parts) await h.model.write(part);
+      h.model.flushLine();
+      assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABC');
+    } finally { h.model.dispose(); }
+  });
+}
+
+test('R03 actual same-glyph replacement after CR remains new text before RIS', async () => {
+  const h = harness();
+  try {
+    await h.model.write('ABC\rABC\x1bc');
+    h.model.flushLine();
+    assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABCABC');
+  } finally { h.model.dispose(); }
+});
+
+for (const [name, restore] of [['ESC save/restore', '\x1b7ABC\x1b8'], ['CSI save/restore', '\x1b[sABC\x1b[u']] as const) {
+  test(`R03 rewritten same glyphs remain new after ${name} before RIS`, async () => {
+    const h = harness();
+    try {
+      await h.model.write('ABC\r' + restore + '\x1bc');
+      h.model.flushLine();
+      assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABCABC');
+    } finally { h.model.dispose(); }
+  });
+}
+
+test('R03 CR followed by fragmented ESC/c keeps its clean checkpoint until native reset', async () => {
+  const h = harness();
+  try {
+    for (const part of ['ABC\r', '\x1b', 'c']) await h.model.write(part);
+    h.model.flushLine();
+    assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABC');
+  } finally { h.model.dispose(); }
+});
+
+test('R03 clean normal rewrite checkpoint survives a non-destructive alternate round trip', async () => {
+  const h = harness();
+  try {
+    await h.model.write('ABC\r\x1b[?1049hALT\x1b[?1049l\x1bc');
+    h.model.flushLine();
+    assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABCALT');
+  } finally { h.model.dispose(); }
+});
+
+for (const [name, input, expected] of [
+  ['CR', '\x1b[?1049hABC\rXYZ\x1b[?1049l', 'ABCXYZ'],
+  ['CR with a dormant normal checkpoint', 'NORMAL\r\x1b[?1049hABC\rXYZ\x1b[?1049l', 'NORMALABCXYZ'],
+  ['BS with an occupied suffix', '\x1b[?1049hABCDE\b\b\bXYZ\x1b[?1049l', 'ABCDEABXYZ'],
+] as const) {
+  test(`R03 ALT checkpoint coalesces the final replacement after ${name}`, async () => {
+    const h = harness();
+    try {
+      await h.model.write(input);
+      h.model.flushLine();
+      assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), expected);
+    } finally { h.model.dispose(); }
+  });
+}
+
+for (const normalCheckpoint of [false, true]) {
+  test(`R03 discarded ALT checkpoint restores native batching; normal checkpoint=${normalCheckpoint}`, { timeout: 15_000 }, async () => {
+    const h = harness();
+    const originalWrite = headless.Terminal.prototype.write;
+    let nativeWrites = 0;
+    // Count the public native API, not private emulator fields or wall time.
+    // This file runs these owned models sequentially; restore the prototype.
+    headless.Terminal.prototype.write = function(data, callback) {
+      nativeWrites++;
+      return originalWrite.call(this, data, callback);
+    };
+    try {
+      await h.model.write((normalCheckpoint ? 'NORMAL\r' : '') + '\x1b[?1049hALT\r\x1b[?1049l');
+      nativeWrites = 0;
+      const text = 'N'.repeat(160);
+      await h.model.write(text);
+      h.model.flushLine();
+      assert.equal(nativeWrites, normalCheckpoint ? 1 + Math.ceil((text.length - 1) / 80) : Math.ceil(text.length / 80));
+      assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), (normalCheckpoint ? 'NORMAL' : '') + 'ALT' + text);
+    } finally {
+      headless.Terminal.prototype.write = originalWrite;
+      h.model.dispose();
+    }
+  });
+}
+
+test('R03 dormant normal checkpoint keeps ALT soft-wrap output before no-scrollback eviction', { timeout: 15_000 }, async () => {
+  const h = harness(16, 4);
+  const text = '0123456789'.repeat(16);
+  try {
+    await h.model.write('N\r\x1b[?1049h' + text + '\x1b[?1049l\x1bc');
+    h.model.flushLine();
+    assert.equal(h.lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'N' + text);
   } finally { h.model.dispose(); }
 });
 
