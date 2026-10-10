@@ -93,11 +93,11 @@ export class TerminalService {
       if (this.entries.get(target.codename)?.session === session) this.entries.delete(target.codename);
     }
   }
-  async dispose(): Promise<void> {
+  async dispose(closePool = true): Promise<void> {
     this.stopping = true;
     await Promise.allSettled([...this.opening]);
     await Promise.allSettled([...this.entries.values()].map(entry => entry.session?.close()));
     this.entries.clear();
-    await this.pool.dispose();
+    if (closePool) await this.pool.dispose();
   }
 }

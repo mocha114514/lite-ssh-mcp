@@ -15,7 +15,8 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, rmdir, rm, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import { fixtureRoot } from './helpers/workspace.js';
+import { mkdir, readFile, rename, rmdir, rm, unlink, writeFile, stat as fsStat, type FileHandle } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,7 +27,7 @@ import { DEFAULT_MAX_PENDING_BYTES } from '../src/cache/prefixes.js';
 import { LiteSshError } from '../src/core/errors.js';
 import type { ParsedLine, ScreenSnapshot, TerminalIdentity } from '../src/core/types.js';
 
-const LABEL_ROOT = resolve(process.cwd(), 'vb-test', 'm0', 'cache-recorder');
+const LABEL_ROOT = fixtureRoot('cache-recorder');
 const CASES_ROOT = join(LABEL_ROOT, 'cases');
 const SENTINEL = join(LABEL_ROOT, 'FOREIGN_SENTINEL.txt');
 const SENTINEL_TEXT = 'foreign-sentinel-must-survive\n';
@@ -105,7 +106,7 @@ function fakeHandle(failAfterWrites: number): FileHandle {
 }
 
 before(async () => {
-  await mkdir(CASES_ROOT, { recursive: true });
+  await mkdir(CASES_ROOT, { recursive: true, mode: 0o700 });
   if (!existsSync(SENTINEL)) await writeFile(SENTINEL, SENTINEL_TEXT, 'utf8');
   assert.equal(await readFile(SENTINEL, 'utf8'), SENTINEL_TEXT);
 });
@@ -530,13 +531,14 @@ describe('BoundedWriteQueue failure handling', () => {
 
 it('R01 a failed initial cache header closes its handle and removes only its owned file', async () => {
   const root = caseRoot('r01-header-failure');
-  await mkdir(root, { recursive: true });
+  await mkdir(root, { recursive: true, mode: 0o700 });
   const owned = join(root, 'owned.context.log');
   const sibling = join(root, 'sibling.txt');
   await writeFile(owned, '', { flag: 'wx' });
   await writeFile(sibling, 'keep sibling\n', { flag: 'wx' });
   let closed = false;
   const handle = {
+    stat: async () => fsStat(owned, { bigint: true }),
     write: async () => { throw Object.assign(new Error('fixture header EIO'), { code: 'EIO' }); },
     close: async () => { closed = true; },
   } as unknown as FileHandle;

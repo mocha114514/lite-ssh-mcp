@@ -8,7 +8,15 @@ import { VERSION } from './mcp/server.js';
 if (process.argv.includes('--version')) {
   process.stdout.write(`lite-ssh-mcp ${VERSION}\n`);
 } else if (process.argv.includes('--help')) {
-  process.stdout.write('lite-ssh-mcp [--help | --version]\nM0 stdio MCP terminal-core prototype. Default configuration: ~/.lite-ssh/config.json\nNormal stdio startup creates missing config.json and config.example.json; existing files are never overwritten.\nConfiguration/login tools read the current configuration; login uses the selected account credentials.\n');
+  process.stdout.write([
+    'lite-ssh-mcp [--help | --version]',
+    'stdio MCP server with 13 tools for named SSH terminals and independent SFTP transfers.',
+    'Default configuration: ~/.lite-ssh/config.json',
+    'Normal startup creates missing config.json and config.example.json; existing files are never overwritten.',
+    'New resources validate current configuration and selected credentials; existing resources retain their connection snapshot.',
+    'Configuration is bounded to 4 MiB; private keys to 1 MiB. Existing permissions are verified, never automatically repaired.',
+    ''
+  ].join('\n'));
 } else if (process.argv.length > 2) {
   process.stderr.write('Unknown argument. Use --help.\n');
   process.exitCode = 2;

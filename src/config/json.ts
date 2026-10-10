@@ -1,4 +1,5 @@
 import { LiteSshError } from '../core/errors.js';
+import { MAX_CONFIG_BYTES, MAX_CONFIG_DEPTH, MAX_CONFIG_NODES } from './limits.js';
 
 /**
  * Strict JSON parsing for the on-disk configuration.
@@ -47,22 +48,34 @@ function hexValue(character: string): number {
 
 class StrictJsonParser {
   private index = 0;
+  private nodes = 0;
+
+  private accountNode(): void {
+    if (++this.nodes > MAX_CONFIG_NODES) {
+      throw new LiteSshError('RESOURCE_LIMIT', 'The configuration exceeds its JSON node budget.');
+    }
+  }
 
   constructor(private readonly text: string) {}
 
   parseDocument(): JsonValue {
-    const value = this.parseValue();
+    const value = this.parseValue(0);
     this.skipWhitespace();
     if (this.index < this.text.length) fail('unexpected trailing content', this.index);
     return value;
   }
 
-  private parseValue(): JsonValue {
+  private parseValue(depth: number): JsonValue {
+    this.accountNode();
     this.skipWhitespace();
     if (this.index >= this.text.length) fail('unexpected end of input', this.index);
     const character = this.text[this.index]!;
-    if (character === '{') return this.parseObject();
-    if (character === '[') return this.parseArray();
+    if (character === '{' || character === '[') {
+      if (depth >= MAX_CONFIG_DEPTH) {
+        throw new LiteSshError('RESOURCE_LIMIT', 'The configuration exceeds its JSON nesting budget.');
+      }
+      return character === '{' ? this.parseObject(depth + 1) : this.parseArray(depth + 1);
+    }
     if (character === '"') return this.parseString();
     if (character === 't') return this.parseLiteral('true', true);
     if (character === 'f') return this.parseLiteral('false', false);
@@ -70,7 +83,7 @@ class StrictJsonParser {
     return this.parseNumber();
   }
 
-  private parseObject(): JsonObject {
+  private parseObject(depth: number): JsonObject {
     this.index += 1; // consume '{'
     // Null-prototype objects keep keys like "__proto__" from touching a prototype.
     const result = Object.create(null) as JsonObject;
@@ -84,13 +97,14 @@ class StrictJsonParser {
       this.skipWhitespace();
       if (this.text[this.index] !== '"') fail('expected a string object key', this.index);
       const keyOffset = this.index;
+      this.accountNode();
       const key = this.parseString();
       if (seenKeys.has(key)) fail('duplicate object key', keyOffset);
       seenKeys.add(key);
       this.skipWhitespace();
       if (this.text[this.index] !== ':') fail('expected ":" after an object key', this.index);
       this.index += 1;
-      result[key] = this.parseValue();
+      result[key] = this.parseValue(depth);
       this.skipWhitespace();
       const separator = this.text[this.index];
       if (separator === ',') {
@@ -105,7 +119,7 @@ class StrictJsonParser {
     }
   }
 
-  private parseArray(): JsonValue[] {
+  private parseArray(depth: number): JsonValue[] {
     this.index += 1; // consume '['
     const result: JsonValue[] = [];
     this.skipWhitespace();
@@ -114,7 +128,7 @@ class StrictJsonParser {
       return result;
     }
     for (;;) {
-      result.push(this.parseValue());
+      result.push(this.parseValue(depth));
       this.skipWhitespace();
       const separator = this.text[this.index];
       if (separator === ',') {
@@ -131,20 +145,26 @@ class StrictJsonParser {
 
   private parseString(): string {
     this.index += 1; // consume opening quote
-    let value = '';
+    let segment = this.index;
+    const parts: string[] = [];
     for (;;) {
       if (this.index >= this.text.length) fail('unterminated string', this.index);
       const character = this.text[this.index]!;
       if (character === '"') {
+        const tail = this.text.slice(segment, this.index);
         this.index += 1;
-        return value;
+        // Plain long credentials need one slice, not millions of one-character
+        // concatenation nodes. Escapes still follow the same strict grammar.
+        if (parts.length === 0) return tail;
+        parts.push(tail);
+        return parts.join('');
       }
       if (character === '\\') {
-        value += this.parseEscape();
+        parts.push(this.text.slice(segment, this.index), this.parseEscape());
+        segment = this.index;
         continue;
       }
       if (character.charCodeAt(0) <= 0x1f) fail('unescaped control character in a string', this.index);
-      value += character;
       this.index += 1;
     }
   }
@@ -233,6 +253,9 @@ class StrictJsonParser {
 }
 
 export function parseJsonStrict(text: string): JsonValue {
+  if (Buffer.byteLength(text, 'utf8') > MAX_CONFIG_BYTES) {
+    throw new LiteSshError('RESOURCE_LIMIT', 'The configuration exceeds the 4 MiB JSON text budget.');
+  }
   const withoutBom = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   return new StrictJsonParser(withoutBom).parseDocument();
 }

@@ -3,10 +3,14 @@
   "version": "0.1.0-m0.1",
   "private": true,
   "license": "MIT",
-  "description": "lite-ssh V2 M0 terminal-core prototype",
+  "description": "stdio MCP server for named SSH terminals and independent SFTP transfers",
   "type": "module",
   "bin": { "lite-ssh-mcp": "dist/cli.js" },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md"
+  ],
   "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc -p tsconfig.json",

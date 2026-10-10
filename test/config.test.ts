@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fixtureRoot } from './helpers/workspace.js';
 import { ConfigStore } from '../src/config/store.js';
 import { LiteSshError } from '../src/core/errors.js';
 
@@ -11,17 +11,16 @@ import { LiteSshError } from '../src/core/errors.js';
  * The files are intentionally left behind on success so a failing run can be
  * inspected; nothing outside this run directory is ever removed.
  */
-const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const RUN_DIR = path.join(PROJECT_ROOT, 'vb-test', 'm0', `config-${process.pid}-${Date.now()}`);
+const RUN_DIR = fixtureRoot('config');
 const FP_A = `SHA256:${'A'.repeat(43)}`;
 const FP_B = `SHA256:${'B'.repeat(43)}`;
 
 let serial = 0;
 
 async function writeFixture(name: string, content: string): Promise<string> {
-  await fs.mkdir(RUN_DIR, { recursive: true });
+  await fs.mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
   const file = path.join(RUN_DIR, `${String(serial += 1).padStart(3, '0')}-${name}.json`);
-  await fs.writeFile(file, content, 'utf8');
+  await fs.writeFile(file, content, { encoding: 'utf8', mode: 0o600 });
   return file;
 }
 

@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { fixtureRoot } from './helpers/workspace.js';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -13,13 +14,13 @@ import type { InputAction } from '../src/core/types.js';
 
 async function fixture(pinned = false, options: { lateSecondShellMs?: number; initializationTimeoutMs?: number } = {}) {
   const ssh = await startMockSsh(options);
-  const root = resolve('vb-test/m0/integration', `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-  await fs.mkdir(root, { recursive: true });
+  const root = fixtureRoot('integration', `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const configPath = join(root, 'config.json');
   await fs.writeFile(configPath, JSON.stringify({ version: 2, servers: { [ssh.ip]: { [ssh.port]: {
     label: 'local generated fixture', ...(pinned ? { hostKeyFingerprint: ssh.fingerprint } : {}),
     accounts: { [ssh.username]: { auth: { type: 'password', password: ssh.password } } }
-  } } } }), 'utf8');
+  } } } }), { encoding: 'utf8', mode: 0o600 });
   const app = createApplication({ configPath, cacheRoot: join(root, 'cache'), writeWaitMs: 180, initializationTimeoutMs: options.initializationTimeoutMs ?? 2000 });
   return { ssh, app, root, target: { ip: ssh.ip, port: ssh.port, username: ssh.username }, terminal: (codename: string) => ({ ip: ssh.ip, port: ssh.port, codename }) };
 }
@@ -219,7 +220,7 @@ test('a running editor consumes Enter and :w without fabricating shell rounds', 
   } finally { await app.close(); await ssh.close(); }
 });
 
-test('MCP registers only actual M0 tools; schemas reject removed view/username targeting', { timeout: 15_000 }, async () => {
+test('MCP registers all thirteen V2 tools; schemas reject removed view/username targeting', { timeout: 15_000 }, async () => {
   const { ssh, app, target } = await fixture(true);
   const client = new Client({ name: 'm0-local-test', version: '1' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -227,8 +228,11 @@ test('MCP registers only actual M0 tools; schemas reject removed view/username t
     await app.server.connect(serverTransport);
     await client.connect(clientTransport);
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 8);
-    assert.equal(tools.tools.some(tool => /upload|download|transfer|_run$|_connect$/.test(tool.name)), false);
+    assert.equal(tools.tools.length, 13);
+    assert.equal(tools.tools.some(tool => /_run$|_connect$|_disconnect$|history/.test(tool.name)), false);
+    for (const name of ['upload', 'download', 'transfer_list', 'transfer_status', 'transfer_cancel']) {
+      assert.equal(tools.tools.some(tool => tool.name === `lite_ssh_${name}`), true);
+    }
     const configurations = await client.callTool({ name: 'lite_ssh_list_configurations', arguments: {} });
     assert.equal(JSON.stringify(configurations.structuredContent).includes(ssh.password), false);
     const opened = await client.callTool({ name: 'lite_ssh_terminal_open', arguments: { ...target, codename: 'mcp_main' } });

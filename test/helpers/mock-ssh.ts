@@ -1,9 +1,14 @@
 import { generateKeyPairSync, createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import ssh2 from 'ssh2';
+import { attachMockSftp, emptySftpStats, type MockSftpOptions } from './mock-sftp.js';
 
 /** Real SSH protocol, simulated shell. Host keys stay in memory; never use ~/.ssh. */
-export async function startMockSsh(options: { lateSecondShellMs?: number } = {}) {
+export async function startMockSsh(options: {
+  lateSecondShellMs?: number;
+  sftpRoot?: string;
+  sftp?: MockSftpOptions;
+} = {}) {
   const key = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
   const parsed = ssh2.utils.parseKey(key.privateKey);
   if (parsed instanceof Error) throw parsed;
@@ -14,6 +19,8 @@ export async function startMockSsh(options: { lateSecondShellMs?: number } = {})
   let shellRequests = 0;
   let openChannels = 0;
   const clients = new Set<ssh2.Connection>();
+  const sftpStats = emptySftpStats();
+  const sftpChannels: Array<{ close(): Promise<void> }> = [];
   const windows: Array<{ rows: number; cols: number }> = [];
   const server = new ssh2.Server({ hostKeys: [key.privateKey] }, client => {
     clients.add(client);
@@ -28,6 +35,13 @@ export async function startMockSsh(options: { lateSecondShellMs?: number } = {})
       authenticatedConnections++;
       client.on('session', accept => {
         const session = accept();
+        if (options.sftpRoot) {
+          session.on('subsystem', (ok, reject, info) => {
+            if (info.name !== 'sftp') { reject(); return; }
+            const channel = ok();
+            sftpChannels.push(attachMockSftp(channel, options.sftpRoot!, sftpStats, options.sftp));
+          });
+        }
         session.on('pty', (ok, _reject, info) => { windows.push({ rows: info.rows, cols: info.cols }); ok?.(); });
         session.on('window-change', (_ok, _reject, info) => { windows.push({ rows: info.rows, cols: info.cols }); });
         session.on('shell', ok => {
@@ -90,7 +104,11 @@ export async function startMockSsh(options: { lateSecondShellMs?: number } = {})
     get authAttempts() { return authAttempts; },
     get authenticatedConnections() { return authenticatedConnections; },
     get queryReplies() { return queryReplies; },
-    get openChannels() { return openChannels; }, windows,
-    async close() { for (const client of clients) client.end(); await new Promise<void>(resolve => server.close(() => resolve())); }
+    get openChannels() { return openChannels; }, windows, sftpStats,
+    async close() {
+      for (const client of clients) client.end();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await Promise.all(sftpChannels.map(channel => channel.close()));
+    }
   };
 }

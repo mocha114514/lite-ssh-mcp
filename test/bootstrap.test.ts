@@ -1,4 +1,5 @@
 import { test, mock } from 'node:test';
+import { fixtureRoot } from './helpers/workspace.js';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
@@ -8,7 +9,7 @@ import { ConfigStore } from '../src/config/store.js';
 import { LiteSshError } from '../src/core/errors.js';
 
 // All files and injected failures stay in this run's owned private fixture tree.
-const RUN = path.resolve('vb-test/m0/first-run/unit', `${process.pid}-${Date.now()}`);
+const RUN = fixtureRoot('bootstrap');
 let serial = 0;
 const fixture = (name: string): string => path.join(RUN, `${++serial}-${name}`, '.lite-ssh', 'config.json');
 const examplePath = (config: string): string => path.join(path.dirname(config), 'config.example.json');
@@ -73,10 +74,10 @@ test('a second initialization preserves both file bytes and modification times',
 
 test('existing files are never read or parsed during initialization', async () => {
   const config = fixture('no-read');
-  await fs.mkdir(path.dirname(config), { recursive: true });
+  await fs.mkdir(path.dirname(config), { recursive: true, mode: 0o700 });
   const original = Buffer.from([0xff, 0x00, 0x01]); // Deliberately not JSON/UTF-8.
-  await fs.writeFile(config, original);
-  await fs.writeFile(examplePath(config), 'user-owned example');
+  await fs.writeFile(config, original, { mode: 0o600 });
+  await fs.writeFile(examplePath(config), 'user-owned example', { mode: 0o600 });
   const spy = mock.method(fs, 'readFile', async () => { throw new Error('Unexpected bootstrap content read.'); });
   try {
     assert.deepEqual(await ensureConfigurationFiles(config), { configCreated: false, exampleCreated: false });
@@ -88,9 +89,9 @@ test('existing files are never read or parsed during initialization', async () =
 
 test('missing example is created without changing an existing config', async () => {
   const config = fixture('only-example');
-  await fs.mkdir(path.dirname(config), { recursive: true });
+  await fs.mkdir(path.dirname(config), { recursive: true, mode: 0o700 });
   const original = 'existing user content, even if invalid';
-  await fs.writeFile(config, original);
+  await fs.writeFile(config, original, { mode: 0o600 });
   assert.deepEqual(await ensureConfigurationFiles(config), { configCreated: false, exampleCreated: true });
   assert.equal(await fs.readFile(config, 'utf8'), original);
   assert.equal(await fs.readFile(examplePath(config), 'utf8'), EXAMPLE_CONFIG_TEXT);
@@ -98,8 +99,8 @@ test('missing example is created without changing an existing config', async () 
 
 test('missing live config is created without changing an existing example', async () => {
   const config = fixture('only-config');
-  await fs.mkdir(path.dirname(config), { recursive: true });
-  await fs.writeFile(examplePath(config), 'edited example');
+  await fs.mkdir(path.dirname(config), { recursive: true, mode: 0o700 });
+  await fs.writeFile(examplePath(config), 'edited example', { mode: 0o600 });
   assert.deepEqual(await ensureConfigurationFiles(config), { configCreated: true, exampleCreated: false });
   assert.equal(await fs.readFile(config, 'utf8'), EMPTY_CONFIG_TEXT);
   assert.equal(await fs.readFile(examplePath(config), 'utf8'), 'edited example');
@@ -120,7 +121,7 @@ test('concurrent initializers publish once and never expose partial live JSON', 
 
 test('a blocked directory reports an initialization error without altering the blocker', async () => {
   const config = fixture('blocked');
-  await fs.mkdir(path.dirname(path.dirname(config)), { recursive: true });
+  await fs.mkdir(path.dirname(path.dirname(config)), { recursive: true, mode: 0o700 });
   await fs.writeFile(path.dirname(config), 'owned fixture blocker');
   await expectInitializationFailure(ensureConfigurationFiles(config));
   assert.equal(await fs.readFile(path.dirname(config), 'utf8'), 'owned fixture blocker');
@@ -128,7 +129,7 @@ test('a blocked directory reports an initialization error without altering the b
 
 test('a publication failure is reported and removes only its owned temporary file', async () => {
   const config = fixture('publication-failure');
-  await fs.mkdir(path.dirname(config), { recursive: true });
+  await fs.mkdir(path.dirname(config), { recursive: true, mode: 0o700 });
   const unrelated = path.join(path.dirname(config), '.unrelated.init.tmp');
   await fs.writeFile(unrelated, 'not owned by bootstrap');
   const spy = mock.method(fs, 'link', async () => { throw Object.assign(new Error('fake unsupported publication'), { code: 'ENOTSUP' }); });

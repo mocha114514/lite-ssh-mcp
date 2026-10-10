@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fixtureRoot } from './helpers/workspace.js';
 import type { AddressInfo } from 'node:net';
 import ssh2 from 'ssh2';
 import type { Server as Ssh2Server } from 'ssh2';
@@ -17,8 +17,7 @@ import { endpointKey } from '../src/core/targets.js';
  * under the private `vb-test/m0/<run>` tree; no real remote, user key or user
  * configuration is ever touched.
  */
-const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const RUN_DIR = path.join(PROJECT_ROOT, 'vb-test', 'm0', `ssh-${process.pid}-${Date.now()}`);
+const RUN_DIR = fixtureRoot('ssh');
 const USERNAME = 'testuser';
 const PASSWORD = 'secret';
 const KEY_USERNAME = 'keyuser';
@@ -52,10 +51,10 @@ async function expectCode(promise: Promise<unknown>, code: string): Promise<Lite
 }
 
 async function writeConfig(portConfig: Record<string, unknown>): Promise<string> {
-  await fs.mkdir(RUN_DIR, { recursive: true });
+  await fs.mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
   const file = path.join(RUN_DIR, `${String(serial += 1).padStart(3, '0')}-config.json`);
   const document = { version: 2, servers: { '127.0.0.1': { [String(port)]: portConfig } } };
-  await fs.writeFile(file, JSON.stringify(document, null, 2), 'utf8');
+  await fs.writeFile(file, JSON.stringify(document, null, 2), { encoding: 'utf8', mode: 0o600 });
   return file;
 }
 
@@ -202,9 +201,9 @@ test('loads a private key only for its own login request', async () => {
     privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
     publicKeyEncoding: { type: 'spki', format: 'pem' },
   });
-  await fs.mkdir(RUN_DIR, { recursive: true });
+  await fs.mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
   const keyFile = path.join(RUN_DIR, 'client-key.pem');
-  await fs.writeFile(keyFile, clientPair.privateKey, 'utf8');
+  await fs.writeFile(keyFile, clientPair.privateKey, { encoding: 'utf8', mode: 0o600 });
   const file = await writeConfig({ accounts: { [KEY_USERNAME]: { auth: { type: 'privateKey', privateKeyPath: keyFile } } } });
   const store = new ConfigStore(file);
   await store.confirmHostKey(endpoint(), expectedFingerprint);
@@ -233,7 +232,7 @@ test('opens a new generation for changed credentials without touching a live con
       servers: Record<string, Record<string, { accounts: Record<string, { auth: { password: string } }> }>>;
     };
     document.servers['127.0.0.1']![String(port)]!.accounts[USERNAME]!.auth.password = 'rotated';
-    await fs.writeFile(file, JSON.stringify(document, null, 2), 'utf8');
+    await fs.writeFile(file, JSON.stringify(document, null, 2), { encoding: 'utf8', mode: 0o600 });
 
     const readyBefore = readyConnections;
     const second = await pool.acquire(target());
@@ -289,7 +288,7 @@ test('R01 trust changed while the configuration lock is held is revalidated unde
     // This test owns the competing writer's lock, and commits only its own fixture.
     const document = JSON.parse(await fs.readFile(file, 'utf8'));
     document.servers['127.0.0.1'][String(port)].hostKeyFingerprint = alternateFingerprint;
-    await fs.writeFile(file, JSON.stringify(document), 'utf8');
+    await fs.writeFile(file, JSON.stringify(document), { encoding: 'utf8', mode: 0o600 });
     const before = await fs.readFile(file, 'utf8');
     await lock.close(); lock = undefined; await fs.unlink(lockPath);
     await expectCode(approval, 'HOST_KEY_MISMATCH');
@@ -339,7 +338,7 @@ test('R01 guarded repeat stays idempotent after another endpoint changes', async
   const otherPort = port === 65535 ? port - 1 : port + 1;
   const document = JSON.parse(await fs.readFile(file, 'utf8'));
   document.servers['127.0.0.1'][String(otherPort)] = { label: 'independent fixture endpoint', accounts: { another: { auth: { type: 'password', password: 'fixture-other-password' } } } };
-  await fs.writeFile(file, JSON.stringify(document), 'utf8');
+  await fs.writeFile(file, JSON.stringify(document), { encoding: 'utf8', mode: 0o600 });
   const pool = new ConnectionPool(new ConfigStore(file));
   try {
     await expectCode(pool.acquire(target()), 'HOST_KEY_UNTRUSTED');

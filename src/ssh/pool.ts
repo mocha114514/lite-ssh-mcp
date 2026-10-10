@@ -1,17 +1,16 @@
 import ssh2 from 'ssh2';
 import type { Client as Ssh2Client, ConnectConfig } from 'ssh2';
-import { promises as fs } from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
+import { createHmac, randomBytes } from 'node:crypto';
 import { LiteSshError } from '../core/errors.js';
 import { endpointKey, normalizeIp } from '../core/targets.js';
 import type { ConnectionLease, Endpoint, LoginTarget, ResolvedLogin } from '../core/types.js';
 import type { ConfigStore } from '../config/store.js';
 import { hostKeyDetails } from './fingerprint.js';
+import { ClientOwner } from './clientOwner.js';
+import { readPrivateKey } from './privateKey.js';
 
 const DEFAULT_READY_TIMEOUT_MS = 20_000;
 const MAX_CONNECTIONS = 32;
-const CLOSE_GRACE_MS = 2_000;
 
 interface HostKeyObservation {
   /** Trust pin used when this concrete server key was observed. */
@@ -22,6 +21,10 @@ interface HostKeyObservation {
   port: number;
 }
 
+interface ConnectionReservation {
+  owner?: ClientOwner;
+}
+
 interface PoolEntry {
   key: string;
   client: Ssh2Client;
@@ -30,47 +33,18 @@ interface PoolEntry {
   ip: string;
   port: number;
   username: string;
-  closed: boolean;
+  readonly closed: boolean;
+  owner: ClientOwner;
 }
 
 function tupleKey(resolved: ResolvedLogin): string {
   return JSON.stringify([resolved.target.ip, resolved.target.port, resolved.target.username, resolved.revision]);
 }
 
-function expandHome(input: string): string {
-  if (input === '~') return os.homedir();
-  if (input.startsWith('~/') || input.startsWith('~\\')) return path.join(os.homedir(), input.slice(2));
-  return input;
-}
-
 function mapConnectError(error: unknown): LiteSshError {
   const message = error instanceof Error ? error.message : '';
   if (/auth/i.test(message)) return new LiteSshError('AUTH_FAILED', 'SSH authentication failed.');
   return new LiteSshError('CONNECTION_LOST', 'The SSH connection failed before it became ready.');
-}
-
-/** Best-effort graceful close of an owned client. */
-async function closeClient(client: Ssh2Client, alreadyClosed: boolean): Promise<void> {
-  if (alreadyClosed) {
-    try { client.end(); } catch { /* already gone */ }
-    return;
-  }
-  await new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(finish, CLOSE_GRACE_MS);
-    client.once('close', finish);
-    try {
-      client.end();
-    } catch {
-      finish();
-    }
-  });
 }
 
 /**
@@ -89,15 +63,48 @@ export class ConnectionPool {
   private readonly pending = new Map<string, Promise<PoolEntry>>();
   private readonly observed = new Map<string, HostKeyObservation>();
   private disposed = false;
+  private closing?: Promise<void>;
+  private readonly acquiring = new Set<Promise<ConnectionLease>>();
+  private readonly clients = new Set<ClientOwner>();
+  private readonly reservations = new Set<ConnectionReservation>();
+  /** Process-local generation MAC, never exposed in leases/results/logs. */
+  private readonly materialGenerationKey = randomBytes(32);
 
   constructor(store: ConfigStore, options?: { readyTimeoutMs?: number }) {
     this.store = store;
     this.readyTimeoutMs = options?.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
   }
 
-  async acquire(target: LoginTarget): Promise<ConnectionLease> {
-    if (this.disposed) throw new LiteSshError('CONNECTION_LOST', 'The connection pool has been disposed.');
-    const resolved = await this.store.resolveLogin(target);
+  acquire(target: LoginTarget): Promise<ConnectionLease> {
+    if (this.disposed) return Promise.reject(new LiteSshError('CONNECTION_LOST', 'The connection pool has been disposed.'));
+    // Track the request before its first configuration/key-loading yield, not
+    // merely after a socket has reached the pending/ready maps.
+    const operation = this.acquireLease(target);
+    this.acquiring.add(operation);
+    void operation.finally(() => this.acquiring.delete(operation)).catch(() => undefined);
+    return operation;
+  }
+
+  private async acquireLease(target: LoginTarget): Promise<ConnectionLease> {
+    let resolved = await this.store.resolveLogin(target);
+    if (this.disposed) throw new LiteSshError('CONNECTION_LOST', 'The connection pool stopped during login resolution.');
+    let privateKey: string | undefined;
+    if (resolved.auth.type === 'privateKey') {
+      // Validate only this selected credential on EVERY new resource request,
+      // including reuse. File rotation at an unchanged path is a new snapshot.
+      privateKey = await readPrivateKey(resolved.auth.privateKeyPath);
+      const parsed = ssh2.utils.parseKey(privateKey, resolved.auth.passphrase);
+      if (parsed instanceof Error || !parsed.isPrivateKey()) {
+        throw new LiteSshError('AUTH_FAILED', 'The configured private key could not be parsed as a private credential.');
+      }
+      const revision = createHmac('sha256', this.materialGenerationKey)
+        .update(resolved.revision)
+        .update('\0')
+        .update(privateKey)
+        .digest('hex');
+      resolved = { ...resolved, revision };
+    }
+    if (this.disposed) throw new LiteSshError('CONNECTION_LOST', 'The connection pool stopped during authentication-material loading.');
     const key = tupleKey(resolved);
 
     const existing = this.entries.get(key);
@@ -109,22 +116,30 @@ export class ConnectionPool {
     const inFlight = this.pending.get(key);
     if (inFlight !== undefined) {
       const entry = await inFlight;
+      if (this.disposed || entry.closed) throw new LiteSshError('CONNECTION_LOST', 'The connection stopped before its lease could be issued.');
       entry.leases += 1;
       return this.makeLease(entry, resolved.target);
     }
 
-    if (this.entries.size + this.pending.size >= MAX_CONNECTIONS) {
+    if (this.reservations.size >= MAX_CONNECTIONS) {
       throw new LiteSshError('RESOURCE_LIMIT', 'The connection pool has reached its connection budget.');
     }
 
-    const creation = this.createEntry(key, resolved);
+    // The reader has its own bounded admission; now reserve exactly once for
+    // the physical generation through handshake, ready leases and actual close.
+    // Do not double-count pending owners or forget closing ones.
+    const reservation: ConnectionReservation = {};
+    this.reservations.add(reservation);
+    const creation = this.createEntry(key, resolved, reservation, privateKey);
     this.pending.set(key, creation);
     let entry: PoolEntry;
     try {
       entry = await creation;
     } finally {
       this.pending.delete(key);
+      if (!reservation.owner) this.reservations.delete(reservation);
     }
+    if (this.disposed || entry.closed) throw new LiteSshError('CONNECTION_LOST', 'The connection stopped before its lease could be issued.');
     entry.leases += 1;
     return this.makeLease(entry, resolved.target);
   }
@@ -169,30 +184,33 @@ export class ConnectionPool {
   }
 
   /** Close every owned connection and refuse further acquisitions. */
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  dispose(): Promise<void> {
     this.disposed = true;
-    const entries = [...this.entries.values()];
-    this.entries.clear();
-    this.observed.clear();
-    await Promise.all(entries.map(async (entry) => {
-      const alreadyClosed = entry.closed;
-      entry.leases = 0;
-      entry.closed = true;
-      await closeClient(entry.client, alreadyClosed);
-    }));
+    this.closing ??= (async () => {
+      this.entries.clear();
+      this.observed.clear();
+      // Physical ownership survives removal from the reusable-entry map.
+      // End already-started clients now; pending acquisitions cannot create
+      // another owner after their post-await stopping checks.
+      const closes = [...this.clients].map(owner => owner.close());
+      const results = Promise.allSettled(closes);
+      await Promise.allSettled([...this.acquiring]);
+      const closed = await results;
+      if (closed.some(result => result.status === 'rejected') || this.clients.size > 0) {
+        throw new LiteSshError('CONNECTION_CLEANUP_FAILED', 'One or more owned SSH clients did not confirm closure.', {
+          unconfirmedClients: this.clients.size
+        });
+      }
+    })();
+    return this.closing;
   }
 
   private makeLease(entry: PoolEntry, target: LoginTarget): ConnectionLease {
-    let released = false;
+    let releasing: Promise<void> | undefined;
     return {
       client: entry.client,
       target,
-      release: async () => {
-        if (released) return;
-        released = true;
-        await this.releaseLease(entry);
-      },
+      release: () => releasing ??= this.releaseLease(entry),
     };
   }
 
@@ -200,14 +218,16 @@ export class ConnectionPool {
     entry.leases = Math.max(0, entry.leases - 1);
     if (entry.leases > 0) return;
     if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
-    const alreadyClosed = entry.closed;
-    entry.closed = true;
-    await closeClient(entry.client, alreadyClosed);
+    await entry.owner.close();
   }
 
-  private async createEntry(key: string, resolved: ResolvedLogin): Promise<PoolEntry> {
+  private async createEntry(
+    key: string,
+    resolved: ResolvedLogin,
+    reservation: ConnectionReservation,
+    privateKey?: string
+  ): Promise<PoolEntry> {
     const { ip, port, username } = resolved.target;
-    const client = new ssh2.Client();
     let rejection: LiteSshError | undefined;
 
     // `hostHash` is intentionally omitted so ssh2 passes the raw host-key blob.
@@ -247,27 +267,41 @@ export class ConnectionPool {
     if (resolved.auth.type === 'password') {
       config.password = resolved.auth.password;
     } else {
-      // Load only this requested login's key, internally. ssh2 still cannot
-      // send user authentication until hostVerifier accepts the server key.
-      config.privateKey = await this.loadPrivateKey(resolved.auth.privateKeyPath);
+      // Already bounded/read/validated for this request, before owning a socket.
+      // Authentication is still gated on hostVerifier accepting the server key.
+      config.privateKey = privateKey!;
       if (resolved.auth.passphrase !== undefined) config.passphrase = resolved.auth.passphrase;
     }
 
+    if (this.disposed) throw new LiteSshError('CONNECTION_LOST', 'The connection pool stopped during authentication-material loading.');
+    const client = new ssh2.Client();
+    const owner = new ClientOwner(client, () => {
+      this.clients.delete(owner);
+      this.reservations.delete(reservation);
+    });
+    reservation.owner = owner;
+    this.clients.add(owner);
     try {
       await this.openConnection(client, config, () => rejection);
     } catch (error) {
-      await closeClient(client, true);
+      try { await owner.close(); }
+      catch {
+        const primary = error instanceof LiteSshError ? error : mapConnectError(error);
+        throw new LiteSshError(primary.code, primary.message, { ...primary.details, connectionCleanupConfirmed: false });
+      }
       throw error;
     }
 
     if (this.disposed) {
-      await closeClient(client, true);
+      await owner.close();
       throw new LiteSshError('CONNECTION_LOST', 'The connection pool was disposed while this connection was opening.');
     }
 
-    const entry: PoolEntry = { key, client, leases: 0, revision: resolved.revision, ip, port, username, closed: false };
+    const entry: PoolEntry = {
+      key, client, owner, leases: 0, revision: resolved.revision, ip, port, username,
+      get closed() { return owner.closed; }
+    };
     client.on('close', () => {
-      entry.closed = true;
       if (this.entries.get(key) === entry) this.entries.delete(key);
     });
     client.on('error', () => {
@@ -303,12 +337,4 @@ export class ConnectionPool {
     });
   }
 
-  private async loadPrivateKey(privateKeyPath: string): Promise<string> {
-    try {
-      return await fs.readFile(expandHome(privateKeyPath), 'utf8');
-    } catch {
-      // Never echo the path: it is not needed to understand the failure.
-      throw new LiteSshError('AUTH_FAILED', 'The configured private key could not be read.');
-    }
-  }
 }

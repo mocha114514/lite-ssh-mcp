@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { fixtureRoot } from './helpers/workspace.js';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -11,21 +12,23 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 const cli = resolve('dist/cli.js');
 
 test('shutdown during paused initialization never attaches a new stdio transport', { timeout: 12_000 }, async () => {
-  const fakeHome = resolve('vb-test/m0/first-run/stdio-stop', `${process.pid}-${Date.now()}`);
-  await fs.mkdir(fakeHome, { recursive: true });
+  const fakeHome = fixtureRoot('first-run/stdio-stop', `${process.pid}-${Date.now()}`);
+  await fs.mkdir(fakeHome, { recursive: true, mode: 0o700 });
   const hook = join(fakeHome, 'pause-initialization.mjs');
-  // Gate only this child's first-run mkdir. Emitting its SIGTERM event works on
+  // Gate only this child's first-run metadata check (all platform adapters). Emitting its SIGTERM event works on
   // Windows too, where child.kill(SIGTERM) bypasses Node's signal handlers.
   await fs.writeFile(hook, `import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
-const mkdir = fs.mkdir;
+const lstat = fs.lstat;
 let release;
-fs.mkdir = async (...args) => {
-  if (args[0] === join(process.env.USERPROFILE, '.lite-ssh')) {
+let paused = false;
+fs.lstat = async (...args) => {
+  if (!paused && args[0] === join(process.env.USERPROFILE, '.lite-ssh')) {
+    paused = true;
     process.send({ stage: 'initialization-paused' });
     await new Promise(resolve => { release = resolve; });
   }
-  return mkdir.apply(fs, args);
+  return lstat.apply(fs, args);
 };
 const control = message => {
   if (message === 'stop') { process.emit('SIGTERM'); process.send({ stage: 'shutdown-emitted' }); }
@@ -64,15 +67,15 @@ process.on('message', control);
 });
 
 test('normal stdio startup initializes a fresh home and keeps examples out of live logins', { timeout: 12_000 }, async () => {
-  const fakeHome = resolve('vb-test/m0/first-run/stdio', `${process.pid}-${Date.now()}`);
-  await fs.mkdir(fakeHome, { recursive: true });
+  const fakeHome = fixtureRoot('first-run/stdio', `${process.pid}-${Date.now()}`);
+  await fs.mkdir(fakeHome, { recursive: true, mode: 0o700 });
   const transport = new StdioClientTransport({ command: process.execPath, args: [cli], cwd: process.cwd(), env: { HOME: fakeHome, USERPROFILE: fakeHome }, stderr: 'pipe' });
   const client = new Client({ name: 'fresh-home-fixture', version: '1' });
   let stderr = '';
   transport.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
   try {
     await client.connect(transport);
-    assert.equal((await client.listTools()).tools.length, 8);
+    assert.equal((await client.listTools()).tools.length, 13);
     assert.deepEqual(JSON.parse(await fs.readFile(join(fakeHome, '.lite-ssh/config.json'), 'utf8')), { version: 2, servers: {} });
     const example = JSON.parse(await fs.readFile(join(fakeHome, '.lite-ssh/config.example.json'), 'utf8')) as { servers: Record<string, unknown> };
     assert.equal(Object.keys(example.servers).length, 2);
@@ -84,8 +87,8 @@ test('normal stdio startup initializes a fresh home and keeps examples out of li
 });
 
 test('startup initialization failure reports a clear stderr error and no protocol stdout', async () => {
-  const fakeHome = resolve('vb-test/m0/first-run/stdio-blocked', `${process.pid}-${Date.now()}`);
-  await fs.mkdir(fakeHome, { recursive: true });
+  const fakeHome = fixtureRoot('first-run/stdio-blocked', `${process.pid}-${Date.now()}`);
+  await fs.mkdir(fakeHome, { recursive: true, mode: 0o700 });
   await fs.writeFile(join(fakeHome, '.lite-ssh'), 'owned fixture blocker');
   const child = spawnSync(process.execPath, [cli], { encoding: 'utf8', timeout: 5000, env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome } });
   assert.equal(child.status, 1);
@@ -96,8 +99,8 @@ test('startup initialization failure reports a clear stderr error and no protoco
 });
 
 test('CLI help/version neither read nor initialize user configuration', async () => {
-  const fakeHome = resolve('vb-test/m0/first-run/help', `${process.pid}-${Date.now()}`);
-  await fs.mkdir(fakeHome, { recursive: true });
+  const fakeHome = fixtureRoot('first-run/help', `${process.pid}-${Date.now()}`);
+  await fs.mkdir(fakeHome, { recursive: true, mode: 0o700 });
   for (const argument of ['--version', '--help']) {
     const child = spawnSync(process.execPath, [cli, argument], {
       encoding: 'utf8', timeout: 5000,
@@ -111,8 +114,8 @@ test('CLI help/version neither read nor initialize user configuration', async ()
 });
 
 test('subprocess stdio initialize -> tools/list -> fake-home config -> clean EOF', { timeout: 12_000 }, async () => {
-  const fakeHome = resolve('vb-test/m0/stdio', `${process.pid}-${Date.now()}`);
-  await fs.mkdir(join(fakeHome, '.lite-ssh'), { recursive: true });
+  const fakeHome = fixtureRoot('stdio', `${process.pid}-${Date.now()}`);
+  await fs.mkdir(join(fakeHome, '.lite-ssh'), { recursive: true, mode: 0o700 });
   await fs.writeFile(join(fakeHome, '.lite-ssh/config.json'), JSON.stringify({ version: 2, servers: { '127.0.0.1': { '2222': {
     accounts: { stdio_fixture: { auth: { type: 'password', password: 'not_a_real_credential' } } }
   } } } }), 'utf8');
@@ -125,7 +128,7 @@ test('subprocess stdio initialize -> tools/list -> fake-home config -> clean EOF
     // Track the exact child PID; the SDK owns only this child, never a process group.
     await fs.writeFile(join(fakeHome, 'child-pid.json'), JSON.stringify({ pid: transport.pid }), 'utf8');
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 8);
+    assert.equal(tools.tools.length, 13);
     const list = await client.callTool({ name: 'lite_ssh_list_configurations', arguments: {} });
     const result = list.structuredContent as { configurations: Array<{ username: string }>; total: number };
     assert.equal(result.total, 1);

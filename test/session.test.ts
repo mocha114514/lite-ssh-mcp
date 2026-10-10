@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { fixtureRoot } from './helpers/workspace.js';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { promises as fs } from 'node:fs';
@@ -17,6 +18,7 @@ import { startMockSsh } from './helpers/mock-ssh.js';
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpServer } from '../src/mcp/server.js';
+import type { TransferManager } from '../src/sftp/manager.js';
 import type { ConfigStore } from '../src/config/store.js';
 import type { ConnectionPool } from '../src/ssh/pool.js';
 import type { TerminalService } from '../src/terminal/service.js';
@@ -33,7 +35,7 @@ test('failed initialization sends do not leave unhandled marker rejections', { t
   let released = 0;
   const client = { shell: (_window: unknown, callback: (error: null, stream: ClientChannel) => void) => callback(null, channel as unknown as ClientChannel) } as unknown as Client;
   const lease: ConnectionLease = { client, target: { ip: '127.0.0.1', port: 2222, username: 'test' }, release: async () => { released++; } };
-  await assert.rejects(TerminalSession.open(lease, { ...lease.target, codename: 'failed_probe' }, { cacheRoot: resolve('vb-test/m0/session/failure'), initializationTimeoutMs: 80 }));
+  await assert.rejects(TerminalSession.open(lease, { ...lease.target, codename: 'failed_probe' }, { cacheRoot: fixtureRoot('session-failure'), initializationTimeoutMs: 80 }));
   await new Promise<void>(resolve => setTimeout(resolve, 120));
   assert.equal(released, 1);
   // node:test itself treats any leaked unhandled rejection as a failing test.
@@ -41,13 +43,13 @@ test('failed initialization sends do not leave unhandled marker rejections', { t
 
 test('a late PTY callback is closed while a different shared-connection terminal stays alive', { timeout: 10_000 }, async () => {
   const ssh = await startMockSsh({ lateSecondShellMs: 450 });
-  const root = resolve('vb-test/m0/session/late', `${process.pid}-${Date.now()}`);
-  await fs.mkdir(root, { recursive: true });
+  const root = fixtureRoot('session-late', `${process.pid}-${Date.now()}`);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const configPath = join(root, 'config.json');
   await fs.writeFile(configPath, JSON.stringify({ version: 2, servers: { [ssh.ip]: { [ssh.port]: {
     hostKeyFingerprint: ssh.fingerprint,
     accounts: { [ssh.username]: { auth: { type: 'password', password: ssh.password } } }
-  } } } }), 'utf8');
+  } } } }), { encoding: 'utf8', mode: 0o600 });
   const app = createApplication({ configPath, cacheRoot: join(root, 'cache'), initializationTimeoutMs: 180 });
   const login = { ip: ssh.ip, port: ssh.port, username: ssh.username };
   try {
@@ -104,6 +106,7 @@ async function gatedRecorder(identity: TerminalIdentity, path: string): Promise<
   // handle records parsed cache bytes in memory and never touches user files.
   await fs.writeFile(path, '', { flag: 'wx' });
   const handle = {
+    stat: async () => fs.stat(path, { bigint: true }),
     write: async (buffer: Buffer, offset: number, length: number) => {
       if (gate) { entered = true; await gate; }
       if (failed) throw Object.assign(new Error('fixture write failure'), { code: 'EIO' });
@@ -170,8 +173,8 @@ async function scriptedSession(tag: string, writeWaitMs = 320): Promise<{ sessio
     target: { ip: identity.ip, port: identity.port, username: identity.username },
     release: async () => undefined,
   };
-  const root = resolve('vb-test/m0/session', `submission-${tag}-${process.pid}-${Date.now()}`);
-  await fs.mkdir(root, { recursive: true });
+  const root = fixtureRoot('session', `submission-${tag}-${process.pid}-${Date.now()}`);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const flush = await gatedRecorder(identity, join(root, 'cache.log'));
   const opened = TerminalSession.open(lease, identity, { initializationTimeoutMs: 4000, writeWaitMs, recorder: flush.recorder });
   await waitFor(() => /LSSH;([A-Za-z0-9_.-]+);STTY/.test(channel.outbound.join('')), 'the shell probe');
@@ -507,7 +510,7 @@ test('R02 genuine SDK cancellations free observer quota without double release o
     if (signal) signals.push(signal);
     return session.write(actions, signal);
   } } as unknown as TerminalService;
-  const server = createMcpServer({} as ConfigStore, {} as ConnectionPool, terminals);
+  const server = createMcpServer({} as ConfigStore, {} as ConnectionPool, terminals, {} as TransferManager);
   const controllers: AbortController[] = [];
   const calls: Promise<unknown>[] = [];
   const target = { ip: '127.0.0.1', port: 22, codename: 'r02_sdk_cancel' };
@@ -707,7 +710,10 @@ test('R01 close interrupts a backpressured send and returns owned cleanup facts'
     void pending.catch(() => undefined);
     await waitFor(() => channel.outbound.join('').includes('held-close'), 'held native write');
     closing = session.close();
-    const result = await Promise.race([closing, new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 500))]);
+    // ACL-backed removal has real platform I/O cost. Keep a finite window
+    // while the write callback remains permanently held; this still proves
+    // that close is independent of backpressured input, not instantaneous.
+    const result = await Promise.race([closing, new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 2000))]);
     assert.ok(result, 'owned close must not sit behind a permanently retained write callback');
     assert.equal(result.cacheRemoved, true);
     assert.equal(flush.handleClosed, true);

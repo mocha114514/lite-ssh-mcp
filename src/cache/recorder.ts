@@ -32,7 +32,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, open, unlink, type FileHandle } from 'node:fs/promises';
+import { open, type FileHandle } from 'node:fs/promises';
+import { ensurePrivateDirectory, requirePrivatePath, unlinkOwnedFile, type PrivateObjectIdentity } from '../platform/permissions.js';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -80,18 +81,7 @@ interface RoundState {
 
 /** Ensure the cache root exists and is private (`0700` on POSIX; ACLs on Windows). */
 async function ensureRoot(root: string): Promise<void> {
-  try {
-    await mkdir(root, { recursive: true, mode: 0o700 });
-  } catch (error) {
-    throw new LiteSshError('CACHE_WRITE_FAILED', 'Could not create the readable cache directory.', {
-      reason: reasonCode(error),
-    });
-  }
-  try {
-    await chmod(root, 0o700);
-  } catch {
-    /* Windows maps POSIX modes onto ACLs and may reject chmod; not fatal. */
-  }
+  await ensurePrivateDirectory(root);
 }
 
 export interface CloseResult {
@@ -105,6 +95,7 @@ export class ReadableRecorder {
 
   private readonly queue: BoundedWriteQueue;
   private readonly handle: FileHandle;
+  private objectIdentity?: PrivateObjectIdentity;
   private roundCounter = 0;
   private stepCounter = 0;
   private frameCounter = 0;
@@ -160,7 +151,33 @@ export class ReadableRecorder {
       });
     }
 
+    let objectIdentity: PrivateObjectIdentity | undefined;
+    try {
+      objectIdentity = await handle.stat({ bigint: true });
+      await requirePrivatePath(chosen, 'file', true, handle);
+    } catch (error) {
+      let cacheRemoved = false;
+      let cleanupError = 'CACHE_DELETE_FAILED acquisition_identity_unavailable';
+      try {
+        if (objectIdentity) {
+          await unlinkOwnedFile(chosen, objectIdentity);
+          cacheRemoved = true;
+          cleanupError = '';
+        }
+      } catch { cleanupError = 'CACHE_DELETE_FAILED ownership_or_boundary_unconfirmed'; }
+      finally {
+        try { await handle.close(); }
+        catch { cleanupError = 'CACHE_WRITE_FAILED handle_close_unconfirmed'; }
+      }
+      const failure = error instanceof LiteSshError ? error
+        : new LiteSshError('CACHE_WRITE_FAILED', 'Could not capture the acquired cache identity. No content was written.');
+      throw new LiteSshError(failure.code, failure.message, {
+        ...failure.details, cachePath: chosen, cacheRemoved,
+        ...(cleanupError ? { cleanupError } : {})
+      });
+    }
     const recorder = new ReadableRecorder(handle, chosen, DEFAULT_MAX_PENDING_BYTES);
+    recorder.objectIdentity = objectIdentity;
     return recorder.initializeHeader(identity, createdAt, instance);
   }
 
@@ -177,6 +194,13 @@ export class ReadableRecorder {
     options?: { maxPendingBytes?: number },
   ): Promise<ReadableRecorder> {
     const recorder = new ReadableRecorder(handle, resolve(path), options?.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES);
+    if (typeof handle.stat === 'function') {
+      try { recorder.objectIdentity = await handle.stat({ bigint: true }); }
+      catch {
+        const cleanup = await recorder.close();
+        throw new LiteSshError('CACHE_WRITE_FAILED', 'The supplied cache handle identity could not be captured.', { cachePath: recorder.path, ...cleanup });
+      }
+    }
     return recorder.initializeHeader(identity, new Date(), 'test');
   }
 
@@ -352,21 +376,22 @@ export class ReadableRecorder {
     } catch {
       /* Write failure was already surfaced by flush()/endRound() and on disk. */
     }
+    let cacheRemoved = false;
+    if (remove) {
+      try {
+        if (!this.objectIdentity) throw new LiteSshError('CACHE_DELETE_FAILED', 'No acquisition identity is available for safe removal.');
+        // Keep the acquired descriptor alive during removal, preventing inode
+        // reuse after closure. Windows deletion may pend until this FD closes.
+        await unlinkOwnedFile(this.path, this.objectIdentity);
+        cacheRemoved = true;
+      } catch (error) {
+        cleanupError = `CACHE_DELETE_FAILED ${reasonCode(error)}`;
+      }
+    }
     try {
       await this.handle.close();
     } catch (error) {
       cleanupError = `CACHE_WRITE_FAILED close:${reasonCode(error)}`;
-    }
-
-    let cacheRemoved = false;
-    if (remove) {
-      try {
-        await unlink(this.path);
-        cacheRemoved = true;
-      } catch (error) {
-        cacheRemoved = false;
-        cleanupError = `CACHE_DELETE_FAILED ${reasonCode(error)}`;
-      }
     }
 
     this.closeResult = cleanupError === undefined ? { cacheRemoved } : { cacheRemoved, cleanupError };

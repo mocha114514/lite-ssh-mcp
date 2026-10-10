@@ -9,6 +9,9 @@ import type { Endpoint, LoginTarget, ResolvedLogin } from '../core/types.js';
 import { isFingerprint } from './fingerprint.js';
 import { parseJsonStrict, type JsonObject, type JsonValue } from './json.js';
 import { buildConfigurationView, type ConfigurationView, type LoginEntry } from './schema.js';
+import { ensurePrivateDirectory, requirePrivatePath, unlinkOwnedFile, type PrivateObjectIdentity } from '../platform/permissions.js';
+import { readConfigurationText } from './file.js';
+import { MAX_CONFIG_BYTES } from './limits.js';
 
 const LOCK_DEADLINE_MS = 5_000;
 const LOCK_RETRY_MS = 50;
@@ -96,6 +99,9 @@ export class ConfigStore {
     }
 
     const release = await this.acquireLock();
+    let confirmationCompleted = false;
+    let configurationChanged = false;
+    let primaryError: unknown;
     try {
       const raw = await this.readRaw();
       const view: ConfigurationView = buildConfigurationView(raw);
@@ -111,7 +117,10 @@ export class ConfigStore {
       const portObject = servers[slot.ipRaw] as JsonObject;
       const entry = portObject[slot.portRaw] as JsonObject;
       guard?.validateObservation();
-      if (entry.hostKeyFingerprint === fingerprint) return { changed: false, fingerprint };
+      if (entry.hostKeyFingerprint === fingerprint) {
+        confirmationCompleted = true;
+        return { changed: false, fingerprint };
+      }
       if (guard && entry.hostKeyFingerprint !== guard.expectedFingerprint) {
         throw new LiteSshError('HOST_KEY_MISMATCH', 'Endpoint trust changed after this observation. Observe and confirm the current key again.', {
           ip, port, fingerprint,
@@ -122,9 +131,31 @@ export class ConfigStore {
       // Async temporary-file writes must not let a newer observation slip past
       // the earlier check. Revalidate immediately before atomic publication.
       await atomicWrite(this.filePath, raw, () => guard?.validateObservation());
+      confirmationCompleted = true;
+      configurationChanged = true;
       return { changed: true, fingerprint };
+    } catch (error) {
+      primaryError = error;
+      throw error;
     } finally {
-      await release();
+      try { await release(); }
+      catch (error) {
+        // A successful rename must not be described as rolled back because
+        // lock cleanup failed. Conversely, preserve a primary validation/write
+        // failure and attach cleanup facts rather than replacing its meaning.
+        const cleanup = error instanceof LiteSshError ? error.details : {};
+        const details = {
+          ...(primaryError instanceof LiteSshError ? primaryError.details : {}),
+          confirmationCompleted,
+          configurationChanged,
+          lockCleanup: { complete: false, ...cleanup }
+        };
+        if (primaryError instanceof LiteSshError) {
+          throw new LiteSshError(primaryError.code, primaryError.message, details);
+        }
+        throw new LiteSshError('CONFIG_LOCK_CLEANUP_FAILED',
+          'Configuration lock cleanup was not confirmed. Check the reported lock name without deleting a replacement object.', details);
+      }
     }
   }
 
@@ -133,15 +164,7 @@ export class ConfigStore {
   }
 
   private async readRaw(): Promise<JsonObject> {
-    let text: string;
-    try {
-      text = await fs.readFile(this.filePath, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        throw new LiteSshError('CONFIG_NOT_FOUND', 'No configuration file was found for the current user.');
-      }
-      throw new LiteSshError('CONFIG_INVALID', 'The configuration file could not be read.');
-    }
+    const text = await readConfigurationText(this.filePath);
     const value: JsonValue = parseJsonStrict(text);
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       throw new LiteSshError('CONFIG_INVALID', 'The configuration root must be a JSON object.');
@@ -152,13 +175,33 @@ export class ConfigStore {
   /** Acquire the exclusive sibling lock, waiting at most the deadline. */
   private async acquireLock(): Promise<() => Promise<void>> {
     const lockPath = `${this.filePath}.lock`;
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
+    await ensurePrivateDirectory(path.dirname(this.filePath));
     const deadline = Date.now() + LOCK_DEADLINE_MS;
     for (;;) {
       let handle: FileHandle | undefined;
       try {
         handle = await fs.open(lockPath, 'wx', 0o600);
+        await requirePrivatePath(lockPath, 'file', true, handle);
       } catch (error) {
+        if (handle !== undefined) {
+          let removalConfirmed = false;
+          let handleCloseConfirmed = false;
+          try { await unlinkOwnedFile(lockPath, handle); removalConfirmed = true; }
+          catch { /* A failed first identity capture is not deletion authority. */ }
+          finally {
+            try { await handle.close(); handleCloseConfirmed = true; }
+            catch { /* Preserve and expose close uncertainty without native details. */ }
+          }
+          const primary = error instanceof LiteSshError ? error
+            : new LiteSshError('CONFIG_LOCKED', 'The acquired configuration lock could not be safely initialized.');
+          throw new LiteSshError(primary.code, primary.message, {
+            ...primary.details,
+            lockCleanup: {
+              removalConfirmed, handleCloseConfirmed,
+              ...(!removalConfirmed ? { possibleResidualPaths: [lockPath] } : {})
+            }
+          });
+        }
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           throw new LiteSshError('CONFIG_LOCKED', 'The configuration lock could not be created.');
         }
@@ -166,16 +209,24 @@ export class ConfigStore {
       if (handle !== undefined) {
         // Only the creator removes the lock; a stale lock is never swept.
         return async () => {
+          let removalConfirmed = false;
+          let handleCloseConfirmed = false;
           try {
-            await fs.rm(lockPath, { force: true });
-          } catch {
-            /* The lock already disappeared; closing the handle is still required. */
-          } finally {
-            try {
-              await handle.close();
-            } catch {
-              /* Nothing further can be done for an already-closed handle. */
-            }
+            // ENOENT is already handled by unlinkOwnedFile. Other errors mean
+            // ownership/boundary/removal is unconfirmed, not 'already gone'.
+            await unlinkOwnedFile(lockPath, handle);
+            removalConfirmed = true;
+          } catch { /* Preserve the uncertain name; report below. */ }
+          finally {
+            try { await handle.close(); handleCloseConfirmed = true; }
+            catch { /* Never claim a failed close was confirmed. */ }
+          }
+          if (!removalConfirmed || !handleCloseConfirmed) {
+            throw new LiteSshError('CONFIG_LOCK_CLEANUP_FAILED', 'The owned configuration lock was not fully cleaned up.', {
+              removalConfirmed,
+              handleCloseConfirmed,
+              ...(!removalConfirmed ? { possibleResidualPaths: [lockPath] } : {})
+            });
           }
         };
       }
@@ -188,13 +239,23 @@ export class ConfigStore {
 }
 
 async function atomicWrite(filePath: string, value: JsonObject, beforeCommit?: () => void): Promise<void> {
+  const serialized = `${JSON.stringify(value, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_CONFIG_BYTES) {
+    throw new LiteSshError('RESOURCE_LIMIT', 'The configuration update exceeds the 4 MiB write budget.');
+  }
+  // New keys also consume structural budget. Never publish a document that
+  // our own reader would reject immediately after a successful confirmation.
+  parseJsonStrict(serialized);
   const directory = path.dirname(filePath);
-  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  await ensurePrivateDirectory(directory);
   const temporary = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
   const handle = await fs.open(temporary, 'wx', 0o600);
+  let identity: PrivateObjectIdentity | undefined;
   let closed = false;
   try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    identity = await handle.stat({ bigint: true });
+    await requirePrivatePath(temporary, 'file', true, handle);
+    await handle.writeFile(serialized, 'utf8');
     await handle.sync();
     await handle.close();
     closed = true;
@@ -204,7 +265,16 @@ async function atomicWrite(filePath: string, value: JsonObject, beforeCommit?: (
     if (!closed) {
       try { await handle.close(); } catch { /* ignore */ }
     }
-    try { await fs.rm(temporary, { force: true }); } catch { /* ignore */ }
-    throw error;
+    let cleanupComplete = false;
+    if (identity) {
+      try { await unlinkOwnedFile(temporary, identity); cleanupComplete = true; }
+      catch { /* Preserve the uncertain object and report it, never force-rm. */ }
+    }
+    const failure = error instanceof LiteSshError ? error
+      : new LiteSshError('CONFIG_WRITE_FAILED', 'The configuration update could not be safely written.');
+    throw new LiteSshError(failure.code, failure.message, {
+      ...failure.details, cleanupComplete,
+      ...(!cleanupComplete ? { possibleResidualPaths: [temporary] } : {})
+    });
   }
 }

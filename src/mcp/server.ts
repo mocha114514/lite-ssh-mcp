@@ -6,6 +6,7 @@ import { LiteSshError, publicError } from '../core/errors.js';
 import { normalizeIp } from '../core/targets.js';
 import { ConnectionPool } from '../ssh/pool.js';
 import { TerminalService } from '../terminal/service.js';
+import { TransferManager } from '../sftp/manager.js';
 import type { InputAction } from '../core/types.js';
 
 export const VERSION = '0.1.0-m0.1';
@@ -38,9 +39,9 @@ async function respond(operation: () => Promise<Record<string, unknown>> | Recor
   return { content: [{ type: 'text' as const, text: readable(result) }], structuredContent: result, ...(result.ok === false ? { isError: true } : {}) };
 }
 
-/** Only implemented M0 tools are registered. SFTP/transfer methods wait for the M3 stage. */
-export function createMcpServer(store: ConfigStore, pool: ConnectionPool, terminals: TerminalService, isStopping: () => boolean = () => false): McpServer {
-  // All eight tool handlers share one admission point; teardown operations use
+/** All thirteen V2 tools share the application's concrete resource owners. */
+export function createMcpServer(store: ConfigStore, pool: ConnectionPool, terminals: TerminalService, transfers: TransferManager, isStopping: () => boolean = () => false): McpServer {
+  // All tool handlers share one admission point; teardown operations use
   // their concrete owners directly and are not routed through this gate.
   const dispatch = (operation: () => Promise<Record<string, unknown>> | Record<string, unknown>) => respond(operation, isStopping);
   const server = new McpServer({ name: 'lite-ssh-mcp-server', version: VERSION }, { capabilities: { logging: {} } });
@@ -59,7 +60,7 @@ export function createMcpServer(store: ConfigStore, pool: ConnectionPool, termin
     title: 'Confirm observed host key', description: 'After showing the observed SHA256 fingerprint to the user and obtaining confirmation, record that exact previously observed fingerprint. Retry the original operation afterward.',
     inputSchema: z.strictObject({ ip, port, fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{43}$/) }), outputSchema,
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
-  }, args => dispatch(async () => ({ ok: true, state: 'host_key_confirmed', ...await pool.confirmHostKey({ ip: args.ip, port: args.port }, args.fingerprint), nextAction: 'Retry the original terminal_open operation; the key is verified again.' })));
+  }, args => dispatch(async () => ({ ok: true, state: 'host_key_confirmed', ...await pool.confirmHostKey({ ip: args.ip, port: args.port }, args.fingerprint), nextAction: 'Retry the original terminal_open/upload/download operation; the key is verified again.' })));
   server.registerTool('lite_ssh_terminal_open', {
     title: 'Open named terminal', description: 'Create an independent named SSH PTY and temporary shell integration. Uses configured credentials; unknown/changed host keys stop before user authentication.',
     inputSchema: z.strictObject({ ip, port, username, codename }), outputSchema,
@@ -90,5 +91,39 @@ export function createMcpServer(store: ConfigStore, pool: ConnectionPool, termin
     inputSchema: z.strictObject(target), outputSchema,
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
   }, args => dispatch(() => terminals.close(args)));
+  const transferInput = z.strictObject({
+    ip, port, username,
+    localPath: z.string().min(1).max(32_768).refine(value => !value.includes('\0')).describe('Absolute local path (or ~/); this is the final object, not a containing folder.'),
+    remotePath: z.string().min(1).max(32_768).refine(value => value.startsWith('/') && !value.includes('\0')).describe('Absolute Linux POSIX path of the final object.'),
+    conflictPolicy: z.enum(['overwrite_merge_off', 'overwrite_merge_on']).default('overwrite_merge_off').describe('Explicit permission to replace same-name files or merge directories. Never implies link following.'),
+    symlinkPolicy: z.enum(['symlink_follow_off', 'symlink_follow_on']).default('symlink_follow_off').describe('Follow source/target/parent/recursive links to content, retaining logical names and target link nodes. Never implies overwrite permission.')
+  });
+  for (const direction of ['upload', 'download'] as const) {
+    server.registerTool(`lite_ssh_${direction}`, {
+      title: `Submit independent ${direction}`,
+      description: 'Authenticate and acquire an independent SFTP channel, then return transferId promptly. Accepted is not completed. Complete bounded preflight precedes target writes; blocked plans perform zero target writes. Query/cancel with transfer tools; terminal_close does not cancel transfers.',
+      inputSchema: transferInput, outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+    }, args => dispatch(() => transfers.accept(direction, args)));
+  }
+  server.registerTool('lite_ssh_transfer_list', {
+    title: 'List transfers and retained results',
+    description: 'Recover this instance\'s transferIds, accounts, paths, phases and progress. Active tasks do not expire; terminal records are retained until recordExpiresAt. Restarted registries are not restored.',
+    inputSchema: z.strictObject(page), outputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  }, args => dispatch(() => transfers.list(args)));
+  const transferId = z.string().regex(/^tr_[0-9a-f-]{36}$/).describe('Concrete transferId from this MCP instance, not a terminal codename.');
+  server.registerTool('lite_ssh_transfer_status', {
+    title: 'Read transfer state and paginated results',
+    description: 'Query actual progress, planning completeness, conflict/link mappings, committed files, failures and cleanup. Page all results with offset/limit; unknown totals remain null. Already committed content is not rolled back.',
+    inputSchema: z.strictObject({ transferId, offset: page.offset, limit: page.limit }), outputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  }, args => dispatch(() => transfers.status(args.transferId, args)));
+  server.registerTool('lite_ssh_transfer_cancel', {
+    title: 'Request transfer cancellation',
+    description: 'Request stopping, not instant success. Poll status for actual stopped/cleanup results. Preserves committed content, removes only identifiable owned temporaries, and never changes a completed task to cancelled.',
+    inputSchema: z.strictObject({ transferId }), outputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }
+  }, args => dispatch(() => transfers.cancel(args.transferId)));
   return server;
 }
