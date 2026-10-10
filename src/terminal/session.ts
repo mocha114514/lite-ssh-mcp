@@ -8,6 +8,7 @@ import type { ConnectionLease, InputAction, RoundResult, ScreenSnapshot, ShellMa
 import { ScreenModel } from './screen.js';
 import { encodeBatch } from './input.js';
 import { detectShell, makeShellBootstrap, makeShellProbe } from '../shell/integration.js';
+import { connectionCleanupFailure, terminalCleanupFailure, withTerminalCleanup } from './cleanup.js';
 
 export interface SessionOptions {
   cacheRoot?: string;
@@ -60,6 +61,12 @@ export class TerminalSession {
   readonly screen: ScreenModel;
   status: TerminalStatus = 'opening';
   private channel?: ClientChannel;
+  /** Only the actual channel close event confirms PTY channel teardown. */
+  private channelClosed = false;
+  /** A timed-out shell request can still return a late, independently owned PTY. */
+  private shellRequestPending = false;
+  /** A late callback is not a close acknowledgment for its returned stream. */
+  private lateChannelCleanupPending = false;
   private readonly sends = new SerialQueue();
   private readonly output = new SerialQueue();
   private readonly roundWrites = new SerialQueue();
@@ -102,6 +109,7 @@ export class TerminalSession {
   /** Closed waiters may inspect the final parsed screen after emulator disposal. */
   private finalScreen?: ScreenSnapshot;
   private closePromise?: Promise<Record<string, unknown>>;
+  private closeResult?: Record<string, unknown>;
   private initialized = false;
 
   private constructor(private readonly lease: ConnectionLease, identity: TerminalIdentity, recorder: ReadableRecorder, options: SessionOptions) {
@@ -130,22 +138,47 @@ export class TerminalSession {
 
   static async open(lease: ConnectionLease, identity: TerminalIdentity, options: SessionOptions = {}): Promise<TerminalSession> {
     // Recorder/model/listeners exist before requesting the shell. ssh2 buffers early data.
-    const recorder = options.recorder ?? await ReadableRecorder.create(identity, options.cacheRoot);
-    const session = new TerminalSession(lease, identity, recorder, options);
+    let ownedRecorder: ReadableRecorder | undefined;
+    let ownedSession: TerminalSession | undefined;
     try {
+      const recorder = options.recorder ?? await ReadableRecorder.create(identity, options.cacheRoot);
+      ownedRecorder = recorder;
+      const session = new TerminalSession(lease, identity, recorder, options);
+      ownedSession = session;
       let requestExpired = false;
       let channel: ClientChannel;
       try {
         channel = await withTimeout(new Promise<ClientChannel>((resolve, reject) => {
-          lease.client.shell({ term: 'xterm-256color', cols: options.cols ?? 80, rows: options.rows ?? 24 }, (error, stream) => {
-            if (requestExpired) {
-              // A timeout does not cancel ssh2's request. A late channel is still ours.
-              if (stream) { try { stream.close(); } catch { stream.destroy(); } }
-              return;
-            }
-            if (error) reject(new LiteSshError('PTY_OPEN_FAILED', 'The SSH server rejected the PTY/shell request.'));
-            else resolve(stream);
-          });
+          session.shellRequestPending = true;
+          try {
+            lease.client.shell({
+              term: 'xterm-256color',
+              cols: options.cols ?? 80,
+              rows: options.rows ?? 24
+            }, (error, stream) => {
+              session.shellRequestPending = false;
+              if (requestExpired) {
+                // A timeout does not cancel ssh2's request. Track a late
+                // concrete channel through its actual close event, including
+                // callbacks arriving while cache/lease teardown is awaiting.
+                if (stream) {
+                  session.lateChannelCleanupPending = true;
+                  stream.once('close', () => { session.lateChannelCleanupPending = false; });
+                  try { stream.close(); }
+                  catch {
+                    try { stream.destroy(); }
+                    catch { /* Keep the unconfirmed owned-channel fact. */ }
+                  }
+                }
+                return;
+              }
+              if (error) reject(new LiteSshError('PTY_OPEN_FAILED', 'The SSH server rejected the PTY/shell request.'));
+              else resolve(stream);
+            });
+          } catch (error) {
+            session.shellRequestPending = false;
+            reject(error);
+          }
         }), session.initializationTimeout, 'PTY_OPEN_TIMEOUT');
       } catch (error) { requestExpired = true; throw error; }
       session.attach(channel);
@@ -165,9 +198,24 @@ export class TerminalSession {
       session.status = 'open';
       return session;
     } catch (error) {
-      // No permanent remote rc file was created. Close the actual owned PTY and lease.
-      await session.close().catch(() => undefined);
-      throw error;
+      // Initialization remains the primary failure even if owned teardown
+      // fails. A factory that never returned has its own acquisition proof;
+      // do not guess ownership of its possible residual file.
+      let cleanup: Record<string, unknown> = {};
+      if (ownedSession) {
+        try { cleanup = await ownedSession.close(); }
+        catch (closeError) { cleanup = terminalCleanupFailure(closeError); }
+        cleanup.cachePath = ownedSession.recorder.path;
+      } else {
+        if (ownedRecorder) {
+          cleanup.cachePath = ownedRecorder.path;
+          try { Object.assign(cleanup, await ownedRecorder.close()); }
+          catch (closeError) { Object.assign(cleanup, terminalCleanupFailure(closeError)); }
+        }
+        try { await lease.release(); }
+        catch (releaseError) { Object.assign(cleanup, connectionCleanupFailure(releaseError)); }
+      }
+      throw withTerminalCleanup(error, identity, cleanup);
     }
   }
 
@@ -203,6 +251,7 @@ export class TerminalSession {
     channel.on('end', () => this.stdoutEnded.resolve());
     channel.stderr.on('end', () => this.stderrEnded.resolve());
     channel.on('close', () => {
+      this.channelClosed = true;
       if (this.status !== 'closing' && this.status !== 'closed') {
         this.status = 'error';
         this.failure ??= new LiteSshError('TERMINAL_EXITED', 'The remote PTY exited; no unfinished round is marked complete.');
@@ -454,6 +503,28 @@ export class TerminalSession {
   }
 
   private current(): Record<string, unknown> {
+    if (this.status === 'closed' && this.closeResult) {
+      return {
+        // Late accepted output may have failed while close awaited EOF. Keep
+        // its deliberately public loss counters, then restore owner/status.
+        ...(this.failure?.details ?? {}),
+        ...(this.recordingFailure?.details ?? {}),
+        ...this.closeResult,
+        currentRound: this.activeRound() ?? null,
+        lastCompletedRound: this.lastResult ?? null,
+        screen: this.finalScreen ?? null,
+        ...(!this.finalScreen ? { screenUnavailable: true } : {}),
+        ...(this.recordingFailure ? {
+          recordingErrorCode: this.recordingFailure.code,
+          cacheMayBeIncomplete: true
+        } : {}),
+        ...(this.failure ? {
+          ok: false,
+          code: this.failure.code,
+          message: this.failure.message
+        } : {})
+      };
+    }
     return {
       // LiteSshError details are deliberately public. Owner/status fields below
       // remain authoritative; a prior transport fault must not hide later EIO loss.
@@ -636,29 +707,95 @@ export class TerminalSession {
   }
   private async performClose(): Promise<Record<string, unknown>> {
     this.status = 'closing';
-    this.notify();
-    await this.sends.run(async () => {
-      if (this.channel && !this.channel.destroyed) {
-        this.channel.close();
-        this.channel.resume();
-        this.channel.stderr.resume();
+    let failure: LiteSshError | undefined;
+    let channelDeadline: unknown;
+    const cleanup: Record<string, unknown> = {};
+    const failed = (error: unknown): void => {
+      failure ??= error instanceof LiteSshError ? error : new LiteSshError(
+        'TERMINAL_CLEANUP_FAILED',
+        'Owned terminal cleanup could not fully complete.'
+      );
+    };
+    const attempt = async (action: () => unknown | Promise<unknown>): Promise<void> => {
+      try { await action(); }
+      catch (error) { failed(error); }
+    };
+    try {
+      await attempt(() => this.notify());
+      await attempt(() => this.sends.run(async () => {
+        if (!this.channel) return;
         try {
-          await withTimeout(Promise.all([this.ended.promise, this.stdoutEnded.promise, this.stderrEnded.promise]), this.initializationTimeout, 'TERMINAL_CLOSE_TIMEOUT');
-        } catch { this.channel.destroy(); }
+          // A channel close event does not drain paused stderr/stdout. Avoid
+          // repeating the close request, but always restore both read sides
+          // and wait for their end events before closing the recorder.
+          if (!this.channelClosed && !this.channel.destroyed) this.channel.close();
+          this.channel.resume();
+          this.channel.stderr.resume();
+          await withTimeout(
+            Promise.all([this.ended.promise, this.stdoutEnded.promise, this.stderrEnded.promise]),
+            this.initializationTimeout,
+            'TERMINAL_CLOSE_TIMEOUT'
+          );
+        } catch (error) {
+          // Force is a request, not proof. A subsequent real close may still
+          // make the channel outcome known before the final result is built.
+          channelDeadline = error;
+          if (!(error instanceof LiteSshError && error.code === 'TERMINAL_CLOSE_TIMEOUT')) failed(error);
+          await attempt(() => this.channel!.destroy());
+          await attempt(() => this.channel!.resume());
+          await attempt(() => this.channel!.stderr.resume());
+        }
+      }));
+      await attempt(() => this.output.drain());
+      await attempt(() => this.roundWrites.drain());
+      try { Object.assign(cleanup, await this.recorder.close()); }
+      catch (error) {
+        Object.assign(cleanup, terminalCleanupFailure(error));
+        failed(error);
       }
-    });
-    await this.output.drain();
-    await this.roundWrites.drain();
-    let cleanup: { cacheRemoved: boolean; cleanupError?: string };
-    try { cleanup = await this.recorder.close(); }
-    finally {
-      this.finalScreen = this.screen.snapshot();
-      this.screen.dispose();
-      await this.lease.release();
+    } finally {
+      // Each finalizer is independent: a screen/cache/connection error must
+      // never skip the remaining local finalizers or erase earlier facts.
+      await attempt(() => { this.finalScreen = this.screen.snapshot(); });
+      await attempt(() => this.screen.dispose());
+      try { await this.lease.release(); }
+      catch (error) {
+        Object.assign(cleanup, connectionCleanupFailure(error));
+        failed(error);
+      }
+      const remoteChannelCleanupConfirmed = this.channel
+        ? this.channelClosed
+        : !this.shellRequestPending && !this.lateChannelCleanupPending;
+      if (!remoteChannelCleanupConfirmed) {
+        failed(channelDeadline ?? new LiteSshError(
+          'TERMINAL_CLOSE_TIMEOUT',
+          'The owned PTY channel has not confirmed closure.'
+        ));
+      }
       this.status = 'closed';
-      this.events.emit('dispose');
-      this.events.removeAllListeners();
+      const result: Record<string, unknown> = {
+        ...cleanup,
+        ok: !failure && cleanup.cacheRemoved === true && !cleanup.cleanupError,
+        state: remoteChannelCleanupConfirmed ? 'closed' : 'error',
+        terminal: { ...this.identity },
+        cachePath: this.recorder.path,
+        localTerminalClosed: true,
+        remoteChannelCleanupConfirmed,
+        remoteBackgroundProcessesTerminated: 'not_guaranteed'
+      };
+      this.closeResult = result;
+      try { this.events.emit('dispose'); }
+      catch (error) { failed(error); }
+      finally { this.events.removeAllListeners(); }
+      if (failure) {
+        Object.assign(result, {
+          ok: false,
+          code: failure.code,
+          message: failure.message,
+          terminalCleanupErrorCode: failure.code
+        });
+      }
     }
-    return { ok: cleanup.cacheRemoved, state: 'closed', terminal: { ...this.identity }, cachePath: this.recorder.path, ...cleanup, remoteBackgroundProcessesTerminated: 'not_guaranteed' };
+    return this.closeResult!;
   }
 }

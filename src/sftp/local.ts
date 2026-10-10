@@ -17,16 +17,21 @@ export function validateWindowsPath(value: string): void {
 }
 
 export function normalizeLocalPath(value: string): string {
+  // Do not collapse link/..: the resolver must visit the link before .. .
   const expanded = value.startsWith('~/') || value.startsWith('~\\')
-    ? path.join(homedir(), value.slice(2)) : value;
+    ? `${homedir()}${path.sep}${value.slice(2)}`
+    : value;
   if (!path.isAbsolute(expanded)) {
     throw new LiteSshError('INVALID_LOCAL_PATH', 'Use an absolute local path or an explicitly expanded ~/ path.');
   }
   if (expanded.includes('\0') || expanded.length > 32_768) {
     throw new LiteSshError('INVALID_LOCAL_PATH', 'The local path is invalid or too long.');
   }
-  if (process.platform === 'win32') validateWindowsPath(expanded);
-  return path.normalize(expanded);
+  if (process.platform === 'win32') {
+    validateWindowsPath(expanded);
+    return expanded.replace(/\//gu, '\\');
+  }
+  return expanded;
 }
 
 function metadata(stats: BigIntStats): Metadata {
@@ -83,7 +88,13 @@ export class LocalFileSystem implements TransferFileSystem {
   }
   async mkdir(value: string): Promise<void> { await fs.mkdir(value, { mode: 0o700 }); }
   async openRead(value: string): Promise<ReadHandle> {
-    return new LocalHandle(await fs.open(value, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)));
+    // A regular source can become a FIFO after preflight. Open without
+    // waiting for a writer, then let the runner's FD type/identity check reject
+    // the replacement before reading or creating any target temporary file.
+    const flags = constants.O_RDONLY
+      | (constants.O_NOFOLLOW ?? 0)
+      | (constants.O_NONBLOCK ?? 0);
+    return new LocalHandle(await fs.open(value, flags));
   }
   async createExclusive(value: string): Promise<WriteHandle> {
     return new LocalHandle(await fs.open(value, 'wx', 0o600));

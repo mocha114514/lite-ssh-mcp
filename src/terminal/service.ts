@@ -1,8 +1,9 @@
 import { normalizeIp, validateTerminalTarget } from '../core/targets.js';
-import { LiteSshError, publicError } from '../core/errors.js';
+import { LiteSshError } from '../core/errors.js';
 import type { InputAction, LoginTarget, PageOptions, TerminalIdentity, TerminalTarget } from '../core/types.js';
 import { ConnectionPool } from '../ssh/pool.js';
 import { TerminalSession, type SessionOptions } from './session.js';
+import { connectionCleanupFailure, terminalCleanupFailure, withTerminalCleanup } from './cleanup.js';
 
 interface Entry { identity: TerminalIdentity; session?: TerminalSession }
 export interface TerminalServiceOptions extends SessionOptions { maxTerminals?: number }
@@ -28,26 +29,20 @@ export class TerminalService {
         entry.session = await TerminalSession.open(lease, identity, this.options);
         return { ...(await entry.session.read()), shellIntegration: 'ready' };
       } catch (error) {
-        // If construction succeeded, the session owns the PTY, recorder and
-        // lease. A failure in the first public read must close that whole owner.
+        // A first public-read failure still owns the whole returned session.
+        // If open never returned, its protected factory/initialization path
+        // already retained cache facts. Releasing the shared lease receipt
+        // again is safe, but its rejection must not replace the primary error.
+        let cleanup: Record<string, unknown> = {};
         if (entry.session) {
-          let cleanup: Record<string, unknown>;
           try { cleanup = await entry.session.close(); }
-          catch (closeError) {
-            // Do not invent a deletion result if owned teardown itself rejected.
-            const code = closeError instanceof LiteSshError ? closeError.code : 'INTERNAL_ERROR';
-            cleanup = { cacheCleanupUnknown: true, cleanupError: `TERMINAL_CLEANUP_FAILED ${code}` };
-          }
-          const { ok: _ok, state: _state, code, message, ...details } = publicError(error);
-          throw new LiteSshError(String(code), String(message), {
-            ...details, terminal: { ...identity }, cachePath: entry.session.recorder.path,
-            ...(typeof cleanup.cacheRemoved === 'boolean' ? { cacheRemoved: cleanup.cacheRemoved } : {}),
-            ...(typeof cleanup.cleanupError === 'string' ? { cleanupError: cleanup.cleanupError } : {}),
-            ...(cleanup.cacheCleanupUnknown === true ? { cacheCleanupUnknown: true } : {}),
-          });
+          catch (closeError) { cleanup = terminalCleanupFailure(closeError); }
+          cleanup.cachePath = entry.session.recorder.path;
+        } else {
+          try { await lease.release(); }
+          catch (releaseError) { cleanup = connectionCleanupFailure(releaseError); }
         }
-        await lease.release();
-        throw error;
+        throw withTerminalCleanup(error, identity, cleanup);
       }
     })();
     this.opening.add(operation);

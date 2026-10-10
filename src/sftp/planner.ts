@@ -1,6 +1,6 @@
 import { LiteSshError } from '../core/errors.js';
 import { checkCancelled, fileError, type Metadata, type TransferFileSystem } from './filesystem.js';
-import { PlanningError, resolvePath, type LinkMapping, type PathGuard } from './paths.js';
+import { appendLogicalPath, PlanningError, resolvePath, type LinkMapping, type PathGuard } from './paths.js';
 import type { TransferIssue, TransferLimits, TransferPolicies } from './types.js';
 
 export interface PlannedEntry {
@@ -69,7 +69,10 @@ export async function planTransfer(
   const retainResolvedGuard = (fs: TransferFileSystem, map: Map<string, PathGuard>, guard: PathGuard): PathGuard => {
     const key = fs.key(guard.path);
     const previous = map.get(key);
-    if (previous) return previous;
+    if (previous) {
+      if (guard.directoryRequired) previous.directoryRequired = true;
+      return previous;
+    }
     // Charge while resolving, not after an unbounded prefix list exists.
     budget.retain(guard);
     map.set(key, guard);
@@ -94,7 +97,12 @@ export async function planTransfer(
     if (depth > limits.depth) throw new LiteSshError('RESOURCE_LIMIT', 'The traversal depth budget was exceeded.');
     let source;
     try {
-      source = await resolvePath(sourceFs, logicalSource, 'source', policies.symlinkPolicy, signal, limits.depth, guard => retainResolvedGuard(sourceFs, plan.sourceGuards, guard));
+      source = await resolvePath(
+        sourceFs, logicalSource, 'source', policies.symlinkPolicy,
+        signal, limits.depth,
+        guard => retainResolvedGuard(sourceFs, plan.sourceGuards, guard),
+        state => budget.retain(state)
+      );
     } catch (error) {
       if (!(error instanceof PlanningError)) throw error;
       addIssue({ ...error.issue, sourcePath: logicalSource, targetPath: logicalTarget });
@@ -121,7 +129,12 @@ export async function planTransfer(
     if (source.metadata.kind === 'directory') plan.sourceGuards.get(sourceKey)!.watchContents = true;
     let target;
     try {
-      target = await resolvePath(targetFs, logicalTarget, 'target', policies.symlinkPolicy, signal, limits.depth, guard => retainResolvedGuard(targetFs, plan.targetGuards, guard));
+      target = await resolvePath(
+        targetFs, logicalTarget, 'target', policies.symlinkPolicy,
+        signal, limits.depth,
+        guard => retainResolvedGuard(targetFs, plan.targetGuards, guard),
+        state => budget.retain(state)
+      );
       addLinks(target.links);
     } catch (error) {
       if (!(error instanceof PlanningError)) throw error;
@@ -136,6 +149,15 @@ export async function planTransfer(
         actualSourcePath: source.actualPath, actualTargetPath: target.actualPath,
         source: source.metadata, sourceGuardKeys, targetGuardKeys
       };
+      // Existing target types are checked below; only an absent syntactic
+      // directory needs this extra check, without duplicating its conflict.
+      if (target.directoryRequired && kind !== 'directory' && !target.metadata) {
+        addIssue({
+          code: 'PATH_TYPE_CONFLICT', side: 'target',
+          sourcePath: logicalSource, targetPath: logicalTarget,
+          actualPath: target.actualPath, sourceType: kind, targetType: 'directory'
+        });
+      }
       if (target.metadata) {
         if (target.metadata.kind !== kind) {
           addIssue({ code: 'PATH_TYPE_CONFLICT', side: 'target', sourcePath: logicalSource, targetPath: logicalTarget, actualPath: target.actualPath, sourceType: kind, targetType: target.metadata.kind });
@@ -194,7 +216,12 @@ export async function planTransfer(
         // must not consume unlimited memory before the entry limit fires.
         budget.retain(name);
         seen.add(name);
-        await walk(sourceFs.paths.join(logicalSource, name), targetFs.paths.join(logicalTarget, name), nested, depth + 1);
+        await walk(
+          appendLogicalPath(sourceFs.paths, logicalSource, name),
+          appendLogicalPath(targetFs.paths, logicalTarget, name),
+          nested,
+          depth + 1
+        );
       }
     }
   };

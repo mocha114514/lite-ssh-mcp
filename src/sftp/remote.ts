@@ -8,7 +8,9 @@ export function normalizeRemotePath(value: string): string {
   if (!value.startsWith('/') || value.includes('\0') || value.length > 32_768) {
     throw new LiteSshError('INVALID_REMOTE_PATH', 'Use an absolute Linux POSIX remote path without NUL characters.');
   }
-  return path.posix.normalize(value);
+  // Preserve every component until resolvePath has applied the link policy.
+  // Lexically removing link/.. can otherwise select a different real object.
+  return value;
 }
 
 function metadata(stats: Stats): Metadata {
