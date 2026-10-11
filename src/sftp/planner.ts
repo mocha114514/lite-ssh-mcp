@@ -206,7 +206,7 @@ export async function planTransfer(
       const nested = new Set(ancestors);
       nested.add(sourceKey);
       const seen = new Set<string>();
-      for await (const name of sourceFs.entries(source.actualPath)) {
+      for await (const name of sourceFs.entries(source.actualPath, signal)) {
         checkCancelled(signal);
         if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\0') ||
             (targetFs.platform === 'windows' && name.includes('\\')) || seen.has(name)) {

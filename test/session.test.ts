@@ -843,3 +843,566 @@ test('R01 a third overlapping packet cannot restore credit in an already ambiguo
     assert.equal(((await session.read()).lastCompletedRound as Record<string, unknown>).round, 'R4');
   } finally { await first?.catch(() => undefined); await second?.catch(() => undefined); await session.close().catch(() => undefined); }
 });
+
+test('F03 hook health false reports SHELL_INTEGRATION_LOST without falseNoExec and self-heals after restoration', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f03-health');
+  try {
+    // 1. Hook is broken (e.g. PS0 overwritten), so command runs but BEGIN is not emitted.
+    const compromised = session.write([{ type: 'text', text: 'audit_broken_cmd' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('audit_broken_cmd\r'), 'compromised handoff');
+    // Output is produced, but END arrives with hookHealthy: false (parts[4] = 0) and no BEGIN
+    feed(channel, 'real command output executed without begin\r\n' + marker(nonce, 'END;0;0'));
+    const compResult = await compromised;
+    // Must NOT declare commandStarted: false or shell_input_finished
+    assert.notEqual(compResult.state, 'shell_input_finished');
+    assert.equal(compResult.commandStarted, undefined);
+    assert.equal(compResult.ok, false);
+    assert.equal(compResult.state, 'error');
+    assert.equal(compResult.code, 'SHELL_INTEGRATION_LOST');
+    assert.equal(compResult.round, 'R1');
+    assert.equal(compResult.exitCode, 0);
+    assert.equal(compResult.commandStartUnknown, true);
+    assert.ok(compResult.cacheRange);
+
+    // Session remains open and observable (entrance not permanently sealed)
+    assert.equal(session.status, 'open');
+    const status = await session.read();
+    assert.equal(status.state, 'open');
+    assert.equal(status.ok, true);
+    const last = status.lastCompletedRound as Record<string, unknown>;
+    assert.equal(last.commandStarted, undefined, 'must not falsely claim non-execution');
+    assert.equal(last.commandStartUnknown, true, 'must carry narrow commandStartUnknown diagnostic');
+
+    // 2. Recovery: Hook is restored, subsequent command executes with healthy BEGIN/END
+    const recovered = session.write([{ type: 'text', text: 'audit_restored_cmd' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('audit_restored_cmd\r'), 'restored handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'restored output\r\n' + marker(nonce, 'END;0;1'));
+    const recResult = await recovered;
+    assert.equal(recResult.state, 'command_completed');
+    assert.equal(recResult.exitCode, 0);
+    assert.equal(recResult.commandStarted, true);
+    assert.ok(String(recResult.output).includes('restored output'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F03 a healthy END after repairing the hook cannot erase known BEGIN loss', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce, flush } = await scriptedSession('f03-repair-boundary');
+  try {
+    // The command that disables the hook still had a real BEGIN. Its unhealthy
+    // END must affect future boundaries without erasing this execution fact.
+    const disabled = session.write([
+      { type: 'text', text: 'disable_begin_hook' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('disable_begin_hook\r'), 'disable handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'hook disabled\r\n' + marker(nonce, 'END;0;0'));
+    const disabledResult = await disabled;
+    assert.equal(disabledResult.state, 'command_completed');
+    assert.equal(disabledResult.commandStarted, true);
+
+    // Repairing PS0 can execute without BEGIN yet restore health before END.
+    // Health at END cannot prove that this already-executed command did not run.
+    const repaired = session.write([
+      { type: 'text', text: 'repair_begin_hook' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('repair_begin_hook\r'), 'repair handoff');
+    feed(channel, 'repair command really executed\r\n' + marker(nonce, 'END;0;1'));
+    const repairedResult = await repaired;
+    assert.equal(repairedResult.state, 'error');
+    assert.equal(repairedResult.code, 'SHELL_INTEGRATION_LOST');
+    assert.equal(repairedResult.commandStarted, undefined);
+    assert.equal(repairedResult.commandStartUnknown, true);
+    assert.ok(String(repairedResult.output).includes('repair command really executed'));
+    const repairedView = await session.read();
+    const repairedRound = repairedView.lastCompletedRound as Record<string, unknown>;
+    assert.equal(repairedRound.commandStarted, undefined);
+    assert.equal(repairedRound.commandStartUnknown, true);
+
+    // A second END-only cycle is still not a positive BEGIN observation.
+    const unmarked = session.write([
+      { type: 'text', text: 'still_without_begin' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('still_without_begin\r'), 'unmarked handoff');
+    feed(channel, 'unmarked output\r\n' + marker(nonce, 'END;0;1'));
+    const unmarkedResult = await unmarked;
+    assert.equal(unmarkedResult.commandStartUnknown, true);
+    assert.equal(unmarkedResult.commandStarted, undefined);
+
+    // A real, valid BEGIN restores boundary trust, not merely a health flag.
+    const trusted = session.write([
+      { type: 'text', text: 'healthy_after_repair' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('healthy_after_repair\r'), 'healthy handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'healthy marked output\r\n' + marker(nonce, 'END;0;1'));
+    const trustedResult = await trusted;
+    assert.equal(trustedResult.state, 'command_completed');
+    assert.equal(trustedResult.commandStarted, true);
+
+    // Once BEGIN has been observed again, a genuine healthy syntax-error END
+    // retains the original non-execution semantics instead of staying unknown.
+    const syntax = session.write([
+      { type: 'text', text: 'invalid_syntax' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('invalid_syntax\r'), 'syntax handoff');
+    feed(channel, 'syntax diagnostics\r\n' + marker(nonce, 'END;2;1'));
+    const syntaxResult = await syntax;
+    assert.equal(syntaxResult.state, 'shell_input_finished');
+    assert.equal(syntaxResult.commandStarted, false);
+    assert.equal(syntaxResult.commandStartUnknown, undefined);
+    assert.equal(syntaxResult.exitCode, 2);
+    // This fixture's FileHandle collects the real serialized recorder writes
+    // in memory; its owned on-disk file is only the safe deletion target.
+    const cache = flush.contents();
+    assert.match(cache, /\[ROUND R2 END\] exitCode=0 commandStartUnknown=true/);
+    assert.match(cache, /\[ROUND R3 END\] exitCode=0 commandStartUnknown=true/);
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F03 an unhealthy END without a reserved cycle is remembered for later repair input', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f03-unowned-health');
+  try {
+    // No input has reserved a candidate yet. Put the visible witness AFTER END
+    // so reading it proves this same packet's unhealthy marker was processed.
+    feed(channel, marker(nonce, 'END;0;0') + 'unowned hook loss observed\r\n');
+    const observed = await waitForRead(session, snapshot => {
+      const screen = snapshot.screen as { lines: string[] };
+      return screen.lines.some(line => line.includes('unowned hook loss observed'));
+    }, 'unowned unhealthy END');
+    assert.equal(observed.currentRound, null);
+    assert.equal(observed.lastCompletedRound, null);
+
+    const repaired = session.write([
+      { type: 'text', text: 'repair_after_unowned_end' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('repair_after_unowned_end\r'), 'unowned repair handoff');
+    feed(channel, 'unowned repair really executed\r\n' + marker(nonce, 'END;0;1'));
+    const result = await repaired;
+    assert.equal(result.state, 'error');
+    assert.equal(result.code, 'SHELL_INTEGRATION_LOST');
+    assert.equal(result.commandStartUnknown, true);
+    assert.equal(result.commandStarted, undefined);
+    assert.ok(String(result.output).includes('unowned repair really executed'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 bare Ctrl-C followed by Enter does not let late END130 claim new submission; factual command completes normally', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-ctrlc-enter');
+  try {
+    // 1. Bare Ctrl-C sent at prompt
+    const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl-c handoff');
+    await ctrlC;
+
+    // 2. Subsequent command submitted before delayed prompt END arrives
+    const pending = session.write([{ type: 'text', text: 'top' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('top\r'), 'top handoff');
+
+    // 3. Delayed prompt END;130 from Ctrl-C arrives
+    feed(channel, marker(nonce, 'END;130;1'));
+
+    // Give a small tick: pending write must NOT claim this END;130
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+    // 4. Authoritative BEGIN and END;0 for 'top' arrive
+    feed(channel, marker(nonce, 'BEGIN') + 'top display body\r\n' + marker(nonce, 'END;0;1'));
+
+    const result = await pending;
+    assert.notEqual(result.exitCode, 130, 'write must not claim old interrupt END130');
+    assert.equal(result.inputHandled, 'unknown', 'provenance barrier marks ambiguous submission unknown');
+
+    // Factual execution is recorded cleanly
+    const current = await session.read();
+    const last = current.lastCompletedRound as Record<string, unknown>;
+    assert.equal(last.commandStarted, true);
+    assert.equal(last.exitCode, 0);
+    assert.ok(String(last.output).includes('top display body'));
+
+    // 5. Subsequent command after barrier clearance safely re-establishes ownership
+    const next = session.write([{ type: 'text', text: 'echo next' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('echo next\r'), 'next handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'next out\r\n' + marker(nonce, 'END;0;1'));
+
+    const nextResult = await next;
+    assert.equal(nextResult.state, 'command_completed');
+    assert.equal(nextResult.exitCode, 0);
+    assert.ok(String(nextResult.output).includes('next out'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 bare Ctrl-C followed by syntax error with single End-only remains unknown, subsequent command is unknown with factual round recorded', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-ambiguous-syntax', 150);
+  try {
+    // 1. Bare Ctrl-C
+    const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl-c handoff');
+    await ctrlC;
+
+    // 2. Syntax error submission
+    const syntaxErr = session.write([{ type: 'text', text: ')' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes(')\r'), 'syntax handoff');
+
+    // 3. Only ONE End-only arrives (unable to distinguish old interrupt vs syntax error)
+    feed(channel, marker(nonce, 'END;2;1'));
+
+    const syntaxResult = await syntaxErr;
+    assert.equal(syntaxResult.inputHandled, 'unknown', 'single End-only cannot be disambiguated, conservatively unknown');
+
+    // 4. In ambiguous episode, nextCmd must not falsely claim command_completed, but factual execution is recorded
+    const nextCmd = session.write([{ type: 'text', text: 'echo ok' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('echo ok\r'), 'nextCmd handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'ok\r\n' + marker(nonce, 'END;0;1'));
+
+    const nextResult = await nextCmd;
+    assert.equal(nextResult.inputHandled, 'unknown', 'ambiguous episode submission remains unknown');
+
+    const current = await session.read();
+    const last = current.lastCompletedRound as Record<string, unknown>;
+    assert.equal(last.commandStarted, true, 'factual execution must be recorded');
+    assert.equal(last.exitCode, 0);
+    assert.ok(String(last.output).includes('ok'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 Ctrl-C followed by syntax error A and command B: B output is not stolen by A', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-ab-syntax');
+  try {
+    // 1. Bare Ctrl-C at prompt settles with interrupt END130
+    const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl-c handoff');
+    feed(channel, marker(nonce, 'END;130;1'));
+    await ctrlC;
+
+    // 2. Authoritative prompt reset: command A submits syntax error ')' in candidate phase
+    feed(channel, marker(nonce, 'BEGIN') + marker(nonce, 'END;0;1')); // Barrier clears on completed round
+    await waitForRead(session, s => (s.lastCompletedRound as Record<string, unknown> | null)?.commandStarted === true, 'barrier reset');
+    const pendingA = session.write([{ type: 'text', text: ')' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes(')\r'), 'A handoff');
+
+    // 3. A syntax error END2 arrives
+    feed(channel, 'bash: syntax error near unexpected token\r\n' + marker(nonce, 'END;2;1'));
+    const resultA = await pendingA;
+    assert.equal(resultA.state, 'shell_input_finished');
+    assert.equal(resultA.exitCode, 2);
+    assert.equal(resultA.commandStarted, false);
+
+    // 4. B submits normal command 'echo B'
+    const pendingB = session.write([{ type: 'text', text: 'echo B' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('echo B\r'), 'B handoff');
+
+    // 5. B begins and completes
+    feed(channel, marker(nonce, 'BEGIN') + 'B output\r\n' + marker(nonce, 'END;0;1'));
+    const resultB = await pendingB;
+    assert.equal(resultB.state, 'command_completed');
+    assert.equal(resultB.exitCode, 0);
+    assert.ok(String(resultB.output).includes('B output'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 bare Ctrl-C with 0 interrupt ENDs followed by command records factual execution', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-0end');
+  try {
+    const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl-c handoff');
+    await ctrlC;
+
+    // Remote emits 0 interrupt ENDs!
+    const cmd = session.write([{ type: 'text', text: 'cmd0' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmd0\r'), 'cmd0 handoff');
+
+    // Real command begins and ends
+    feed(channel, marker(nonce, 'BEGIN') + 'cmd0 out\r\n' + marker(nonce, 'END;0;1'));
+    const result = await cmd;
+    assert.equal(result.inputHandled, 'unknown');
+
+    const current = await session.read();
+    const last = current.lastCompletedRound as Record<string, unknown>;
+    assert.equal(last.commandStarted, true);
+    assert.equal(last.exitCode, 0);
+    assert.ok(String(last.output).includes('cmd0 out'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 two bare Ctrl-Cs with two late END130s do not claim subsequent command', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-2ctrlc');
+  try {
+    // Two Ctrl-Cs
+    const c1 = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'first ctrl-c');
+    await c1;
+    const c2 = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await c2;
+
+    const cmd = session.write([{ type: 'text', text: 'top' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('top\r'), 'top handoff');
+
+    // Two late interrupt ENDs arrive
+    feed(channel, marker(nonce, 'END;130;1'));
+    feed(channel, marker(nonce, 'END;130;1'));
+
+    // Real command begins and ends
+    feed(channel, marker(nonce, 'BEGIN') + 'top out\r\n' + marker(nonce, 'END;0;1'));
+    const result = await cmd;
+    assert.notEqual(result.exitCode, 130, 'must not claim either interrupt END130');
+    assert.equal(result.inputHandled, 'unknown');
+
+    const current = await session.read();
+    const last = current.lastCompletedRound as Record<string, unknown>;
+    assert.equal(last.commandStarted, true);
+    assert.equal(last.exitCode, 0);
+    assert.ok(String(last.output).includes('top out'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 active queued A cancelled before BEGIN preserves original expired protections from stealing B token', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-cancel-barrier');
+  try {
+    // 1. In unstarted candidate phase at prompt, writer A queues input
+    const controllerA = new AbortController();
+    const pendingA = session.write([{ type: 'text', text: 'queued_a' }, { type: 'key', key: 'ENTER' }], controllerA.signal);
+    await waitFor(() => channel.outbound.join('').includes('queued_a\r'), 'queued_a handoff');
+
+    // 2. Writer A cancels observation before BEGIN arrives
+    controllerA.abort();
+    const resultA = await pendingA;
+    assert.equal(resultA.observationCancelled, true);
+
+    // 3. Writer B arrives after A cancelled
+    const pendingB = session.write([{ type: 'text', text: 'writer_b' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('writer_b\r'), 'writer_b handoff');
+
+    // 4. Old command A starts (late BEGIN) and finishes with END0
+    feed(channel, marker(nonce, 'BEGIN') + 'a_out\r\n' + marker(nonce, 'END;0;1'));
+
+    // Writer B must NOT be stolen by cancelled A's late execution!
+    const resultB = await pendingB;
+    assert.equal(resultB.inputHandled, 'unknown', 'cancelled A barrier must prevent B from stealing A completion');
+
+    // Factual execution of A was NOT swallowed: lastCompletedRound records real commandStarted: true
+    const current = await session.read();
+    assert.equal(current.completionOwnership, 'unknown');
+    const last = current.lastCompletedRound as Record<string, unknown>;
+    assert.equal(last.commandStarted, true, 'factual execution must be recorded, not falseNoExec');
+    assert.equal(last.exitCode, 0);
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 bare Ctrl-C followed by batch packet with multiple Enters escalates to permanent ambiguous ownership', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-batch-multi-enter');
+  try {
+    // 1. Bare Ctrl-C at prompt
+    const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl-c handoff');
+    await ctrlC;
+
+    // 2. During barrier, a batch packet with 2 Enters is submitted
+    const batch = session.write([
+      { type: 'text', text: 'cmd1' },
+      { type: 'key', key: 'ENTER' },
+      { type: 'text', text: 'cmd2' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('cmd2\r'), 'batch handoff');
+
+    // 3. cmd1 executes
+    feed(channel, marker(nonce, 'BEGIN') + 'cmd1 out\r\n' + marker(nonce, 'END;0;1'));
+    await batch;
+
+    // 4. Subsequent command C arrives after cmd1 completed
+    const cmdC = session.write([{ type: 'text', text: 'cmdC' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmdC\r'), 'cmdC handoff');
+
+    // Because multiple Enters entered during barrier, ownershipAmbiguous escalated to true!
+    const resultC = await cmdC;
+    assert.equal(resultC.inputHandled, 'unknown', 'batch multi-enter during barrier escalates to ambiguous ownership');
+
+    // 5. Late cmd2 begins and completes
+    feed(channel, marker(nonce, 'BEGIN') + 'cmd2 out\r\n' + marker(nonce, 'END;0;1'));
+
+    // Command C was protected and never stolen by late cmd2
+    const current = await session.read();
+    assert.equal(current.completionOwnership, 'unknown');
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 bare Ctrl-C followed by two independent packets during barrier escalates to permanent ambiguous ownership', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-two-packets-barrier');
+  try {
+    // 1. Bare Ctrl-C at prompt
+    const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl-c handoff');
+    await ctrlC;
+
+    // 2. During barrier, two independent packets are submitted
+    const p1 = session.write([{ type: 'text', text: 'cmdA' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmdA\r'), 'p1 handoff');
+    const p2 = session.write([{ type: 'text', text: 'cmdB' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmdB\r'), 'p2 handoff');
+
+    // 3. cmdA executes
+    feed(channel, marker(nonce, 'BEGIN') + 'cmdA out\r\n' + marker(nonce, 'END;0;1'));
+    await p1;
+    await p2;
+
+    // 4. Subsequent command C arrives after cmdA completed
+    const cmdC = session.write([{ type: 'text', text: 'cmdC' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmdC\r'), 'cmdC handoff');
+
+    const resultC = await cmdC;
+    assert.equal(resultC.inputHandled, 'unknown', 'multiple independent packets during barrier escalate to ambiguous ownership');
+
+    // 5. Late cmdB begins and completes
+    feed(channel, marker(nonce, 'BEGIN') + 'cmdB out\r\n' + marker(nonce, 'END;0;1'));
+
+    const current = await session.read();
+    assert.equal(current.completionOwnership, 'unknown');
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 same packet containing Ctrl-C and Enter sets barrier, counts episode input, and does not claim 130', { timeout: 10_000 }, async () => {
+  const { session, channel, nonce } = await scriptedSession('f04-same-packet-ctrlc');
+  try {
+    // Single packet contains both Ctrl-C and command with Enter
+    const samePacket = session.write([
+      { type: 'key', key: 'CTRL_C' },
+      { type: 'text', text: 'echo same' },
+      { type: 'key', key: 'ENTER' },
+    ]);
+    await waitFor(() => channel.outbound.join('').includes('echo same\r'), 'same packet handoff');
+
+    // Late interrupt END;130 arrives
+    feed(channel, marker(nonce, 'END;130;1'));
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+    // Authoritative BEGIN and END0 for echo same arrive
+    feed(channel, marker(nonce, 'BEGIN') + 'same out\r\n' + marker(nonce, 'END;0;1'));
+
+    const result = await samePacket;
+    assert.notEqual(result.exitCode, 130, 'same packet must not claim old interrupt 130');
+    assert.equal(result.inputHandled, 'unknown');
+
+    const current = await session.read();
+    const last = current.lastCompletedRound as Record<string, unknown>;
+    assert.equal(last.commandStarted, true);
+    assert.equal(last.exitCode, 0);
+    assert.ok(String(last.output).includes('same out'));
+
+    // Single submission completed: barrier clears and next command regains ownership
+    const next = session.write([{ type: 'text', text: 'echo next' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('echo next\r'), 'next handoff');
+    feed(channel, marker(nonce, 'BEGIN') + 'next ok\r\n' + marker(nonce, 'END;0;1'));
+
+    const nextResult = await next;
+    assert.equal(nextResult.state, 'command_completed');
+    assert.equal(nextResult.exitCode, 0);
+    assert.ok(String(nextResult.output).includes('next ok'));
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});
+
+test('F04 interleaved Ctrl-C, A1, second Ctrl-C, A2 preserves submission counter across repeated Ctrl-C and protects C', { timeout: 10_000 }, async () => {
+  // Use a generous observation budget (1500ms) to ensure C is actively observing
+  // when late A2 arrives, proving protection comes from ambiguous ownership, not timeout.
+  const { session, channel, nonce } = await scriptedSession('f04-interleaved-ctrlc', 1500);
+  try {
+    // 1. First bare Ctrl-C sets interruptBarrier=true (submissions=0)
+    const ctrl1 = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl1 handoff');
+    await ctrl1;
+
+    // 2. A1 submitted during barrier (submissions count=1, BEGIN not yet parsed)
+    const pendingA1 = session.write([{ type: 'text', text: 'cmdA1' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmdA1\r'), 'A1 handoff');
+
+    // 3. Second bare Ctrl-C arrives: must NOT reset interruptSubmissions counter while barrier is active
+    const ctrl2 = session.write([{ type: 'key', key: 'CTRL_C' }]);
+    await waitFor(() => channel.outbound.filter(c => c.includes('\x03')).length >= 2, 'ctrl2 handoff');
+    await ctrl2;
+
+    // 4. A2 submitted (submissions count becomes 2 -> escalates to permanent ownershipAmbiguous)
+    const pendingA2 = session.write([{ type: 'text', text: 'cmdA2' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmdA2\r'), 'A2 handoff');
+
+    // 5. A1 executes with BEGIN/END0
+    feed(channel, marker(nonce, 'BEGIN') + 'A1 out\r\n' + marker(nonce, 'END;0;1'));
+    await waitForRead(session, s => (s.lastCompletedRound as Record<string, unknown> | null)?.commandStarted === true, 'A1 completed');
+    await pendingA1;
+
+    // 6. Start fresh command C, verify C bytes have actually been handed off to channel,
+    // but DO NOT wait for C promise to finish — C is actively observing with 1500ms budget.
+    const pendingC = session.write([{ type: 'text', text: 'cmdC' }, { type: 'key', key: 'ENTER' }]);
+    await waitFor(() => channel.outbound.join('').includes('cmdC\r'), 'cmdC handoff');
+
+    // 7. While C is actively observing (well before deadline), late A2 executes with BEGIN/END0.
+    // In buggy code (counter reset to 0), C would mistakenly claim A2 as command_completed!
+    feed(channel, marker(nonce, 'BEGIN') + 'A2 out\r\n' + marker(nonce, 'END;0;1'));
+
+    // 8. Await C: C must NOT claim A2, must remain unknown, and must NOT receive A2 output.
+    const resultC = await pendingC;
+    assert.notEqual(resultC.state, 'command_completed', 'cmdC must NOT claim late A2 execution');
+    assert.equal(resultC.inputHandled, 'unknown', 'cmdC must remain unknown under ambiguous ownership');
+    assert.ok(!String(resultC.output ?? '').includes('A2 out'), 'cmdC must not receive A2 output');
+
+    // 9. Confirm factual A2 round is recorded in cache/round history
+    const factualA2 = await waitForRead(
+      session,
+      s => {
+        const last = s.lastCompletedRound as Record<string, unknown> | null;
+        return last?.commandStarted === true && String(last?.output).includes('A2 out');
+      },
+      'A2 factual completion',
+    );
+    const lastA2 = factualA2.lastCompletedRound as Record<string, unknown>;
+    assert.equal(lastA2.exitCode, 0);
+    assert.equal(lastA2.commandStarted, true);
+    assert.ok(String(lastA2.output).includes('A2 out'));
+
+    // 10. Subsequent factual C execution also recorded if run
+    feed(channel, marker(nonce, 'BEGIN') + 'C out\r\n' + marker(nonce, 'END;0;1'));
+    const factualC = await waitForRead(
+      session,
+      s => {
+        const last = s.lastCompletedRound as Record<string, unknown> | null;
+        return last?.commandStarted === true && String(last?.output).includes('C out');
+      },
+      'C factual completion',
+    );
+    const lastC = factualC.lastCompletedRound as Record<string, unknown>;
+    assert.equal(lastC.exitCode, 0);
+    assert.equal(lastC.commandStarted, true);
+    assert.ok(String(lastC.output).includes('C out'));
+
+    const current = await session.read();
+    assert.equal(current.completionOwnership, 'unknown');
+    await pendingA2.catch(() => undefined);
+  } finally {
+    await session.close().catch(() => undefined);
+  }
+});

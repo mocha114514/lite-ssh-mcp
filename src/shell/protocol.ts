@@ -62,7 +62,14 @@ export function parseMarker(data: string, nonce: string): ShellMarker | null {
       if (raw === undefined || raw === '') return null;
       const exitCode = Number(raw);
       if (!Number.isInteger(exitCode) || exitCode < 0) return null;
-      return { nonce, kind: 'end', exitCode };
+      // The optional health field is emitted by the new bootstrap. Keep the
+      // legacy marker shape unchanged; Session supplies its legacy default.
+      return {
+        nonce,
+        kind: 'end',
+        exitCode,
+        ...(parts[4] !== undefined ? { hookHealthy: parts[4] === '1' } : {}),
+      };
     }
     case 'UNSUPPORTED': {
       // Reason is free text after the event keyword; empty is still valid.

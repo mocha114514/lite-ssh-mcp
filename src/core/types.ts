@@ -33,7 +33,7 @@ export type ShellMarker = { nonce: string } & (
   | { kind: 'stty'; value: string }
   | { kind: 'ready'; shell: ShellKind }
   | { kind: 'begin' }
-  | { kind: 'end'; exitCode: number }
+  | { kind: 'end'; exitCode: number; hookHealthy?: boolean }
   | { kind: 'unsupported'; reason: string }
 );
 export interface ScreenModes {
@@ -73,6 +73,8 @@ export interface ScreenOptions {
 export interface RoundResult {
   /** false when the shell handled/rejected submitted input without starting execution. */
   commandStarted?: boolean;
+  /** true when shell integration health was compromised, so command start state is unknown. */
+  commandStartUnknown?: boolean;
   round: string; exitCode: number; outputCharacters: number;
   output: string | null; outputOmitted: boolean;
   cacheRange: { beginMarker: string; endMarker: string };

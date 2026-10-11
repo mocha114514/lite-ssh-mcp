@@ -3,7 +3,7 @@ import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { LiteSshError } from '../core/errors.js';
-import type { Metadata, ReadHandle, TransferFileSystem, WriteHandle } from './filesystem.js';
+import { checkCancelled, type Metadata, type ReadHandle, type TransferFileSystem, type WriteHandle } from './filesystem.js';
 
 export function validateWindowsPath(value: string): void {
   const root = path.win32.parse(value).root;
@@ -81,10 +81,14 @@ export class LocalFileSystem implements TransferFileSystem {
     }
   }
   readlink(value: string): Promise<string> { return fs.readlink(value); }
-  async *entries(value: string): AsyncIterable<string> {
+  async *entries(value: string, signal?: AbortSignal): AsyncIterable<string> {
+    if (signal) checkCancelled(signal);
     const directory = await fs.opendir(value);
     // for-await owns closure even if the planner aborts at its resource limit.
-    for await (const entry of directory) yield entry.name;
+    for await (const entry of directory) {
+      if (signal) checkCancelled(signal);
+      yield entry.name;
+    }
   }
   async mkdir(value: string): Promise<void> { await fs.mkdir(value, { mode: 0o700 }); }
   async openRead(value: string): Promise<ReadHandle> {

@@ -31,7 +31,7 @@ export interface TransferFileSystem {
   validate(value: string): void;
   lstat(value: string): Promise<Metadata | undefined>;
   readlink(value: string): Promise<string>;
-  entries(value: string): AsyncIterable<string>;
+  entries(value: string, signal?: AbortSignal): AsyncIterable<string>;
   mkdir(value: string): Promise<void>;
   openRead(value: string): Promise<ReadHandle>;
   createExclusive(value: string): Promise<WriteHandle>;

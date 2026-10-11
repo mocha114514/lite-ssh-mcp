@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { LiteSshError } from '../src/core/errors.js';
 import { LocalFileSystem, normalizeLocalPath } from '../src/sftp/local.js';
 import { normalizeRemotePath } from '../src/sftp/remote.js';
-import { appendLogicalPath, resolvePath } from '../src/sftp/paths.js';
+import { appendLogicalPath, assertObservedGuards, resolvePath } from '../src/sftp/paths.js';
 import { planTransfer } from '../src/sftp/planner.js';
 import { runTransfer } from '../src/sftp/runner.js';
 import { TRANSFER_LIMITS } from '../src/sftp/types.js';
@@ -336,4 +336,103 @@ test('an opened special-object replacement is rejected and closed before any tar
   assert.equal(reads, 0);
   assert.equal(closes, 1);
   assert.deepEqual(target.mutations, []);
+});
+
+test('assertObservedGuards succeeds when observed guards match expected plan guards', () => {
+  const fs = new MemorySftpFs();
+  const expectedMap = new Map([
+    [fs.key('/a'), { path: '/a', metadata: { kind: 'file' as const, size: 10, mtime: 100, mode: 0o644, identity: 'id-1' } }]
+  ]);
+  const observed = [
+    { path: '/a', metadata: { kind: 'file' as const, size: 10, mtime: 100, mode: 0o644, identity: 'id-1' } }
+  ];
+  assert.doesNotThrow(() => assertObservedGuards(fs, observed, expectedMap, false));
+});
+
+test('assertObservedGuards throws PATH_CHANGED when observed identity differs', () => {
+  const fs = new MemorySftpFs();
+  const expectedMap = new Map([
+    [fs.key('/a'), { path: '/a', metadata: { kind: 'file' as const, size: 10, mtime: 100, mode: 0o644, identity: 'id-1' } }]
+  ]);
+  const observed = [
+    { path: '/a', metadata: { kind: 'file' as const, size: 10, mtime: 100, mode: 0o644, identity: 'id-mutated' } }
+  ];
+  assert.throws(
+    () => assertObservedGuards(fs, observed, expectedMap, false),
+    (err: unknown) => err instanceof LiteSshError && err.code === 'PATH_CHANGED'
+  );
+});
+
+test('assertObservedGuards throws PATH_CHANGED when observed file size or mtime differs', () => {
+  const fs = new MemorySftpFs();
+  const expectedMap = new Map([
+    [fs.key('/a'), { path: '/a', metadata: { kind: 'file' as const, size: 10, mtime: 100, mode: 0o644, identity: 'id-1' } }]
+  ]);
+  const observedSize = [
+    { path: '/a', metadata: { kind: 'file' as const, size: 99, mtime: 100, mode: 0o644, identity: 'id-1' } }
+  ];
+  assert.throws(
+    () => assertObservedGuards(fs, observedSize, expectedMap, false),
+    (err: unknown) => err instanceof LiteSshError && err.code === 'PATH_CHANGED'
+  );
+
+  const observedMtime = [
+    { path: '/a', metadata: { kind: 'file' as const, size: 10, mtime: 5555, mode: 0o644, identity: 'id-1' } }
+  ];
+  assert.throws(
+    () => assertObservedGuards(fs, observedMtime, expectedMap, false),
+    (err: unknown) => err instanceof LiteSshError && err.code === 'PATH_CHANGED'
+  );
+});
+
+test('assertObservedGuards throws PATH_CHANGED when observed symlink target differs', () => {
+  const fs = new MemorySftpFs();
+  const expectedMap = new Map([
+    [fs.key('/link'), { path: '/link', linkTarget: '/target1', metadata: { kind: 'symlink' as const, size: 0, mtime: 0, mode: 0o777 } }]
+  ]);
+  const observed = [
+    { path: '/link', linkTarget: '/target2', metadata: { kind: 'symlink' as const, size: 0, mtime: 0, mode: 0o777 } }
+  ];
+  assert.throws(
+    () => assertObservedGuards(fs, observed, expectedMap, false),
+    (err: unknown) => err instanceof LiteSshError && err.code === 'PATH_CHANGED'
+  );
+});
+
+test('assertObservedGuards throws PATH_CHANGED when observed path is missing from expected map', () => {
+  const fs = new MemorySftpFs();
+  const expectedMap = new Map<string, { path: string; metadata?: any }>();
+  const observed = [
+    { path: '/unplanned', metadata: { kind: 'file' as const, size: 10, mtime: 100, mode: 0o644 } }
+  ];
+  assert.throws(
+    () => assertObservedGuards(fs, observed, expectedMap, false),
+    (err: unknown) => err instanceof LiteSshError && err.code === 'PATH_CHANGED'
+  );
+});
+
+test('assertObservedGuards allows directory mtime updates without false alarm', () => {
+  const fs = new MemorySftpFs();
+  const expectedMap = new Map([
+    [fs.key('/dir'), { path: '/dir', metadata: { kind: 'directory' as const, size: 0, mtime: 100, mode: 0o755, identity: 'dir-id' } }]
+  ]);
+  // Directory mtime changed from 100 to 9999 due to child creation:
+  const observed = [
+    { path: '/dir', metadata: { kind: 'directory' as const, size: 4096, mtime: 9999, mode: 0o755, identity: 'dir-id' } }
+  ];
+  assert.doesNotThrow(() => assertObservedGuards(fs, observed, expectedMap, false));
+});
+
+test('assertObservedGuards throws PATH_CHANGED on source directory mtime change when watchContents is true', () => {
+  const fs = new MemorySftpFs();
+  const expectedMap = new Map([
+    [fs.key('/src/dir'), { path: '/src/dir', watchContents: true, metadata: { kind: 'directory' as const, size: 0, mtime: 100, mode: 0o755, identity: 'dir-id' } }]
+  ]);
+  const observed = [
+    { path: '/src/dir', metadata: { kind: 'directory' as const, size: 0, mtime: 200, mode: 0o755, identity: 'dir-id' } }
+  ];
+  assert.throws(
+    () => assertObservedGuards(fs, observed, expectedMap, true),
+    (err: unknown) => err instanceof LiteSshError && err.code === 'PATH_CHANGED'
+  );
 });

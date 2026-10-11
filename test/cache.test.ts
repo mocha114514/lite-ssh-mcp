@@ -26,6 +26,7 @@ import { BoundedWriteQueue } from '../src/cache/writeQueue.js';
 import { DEFAULT_MAX_PENDING_BYTES } from '../src/cache/prefixes.js';
 import { LiteSshError } from '../src/core/errors.js';
 import type { ParsedLine, ScreenSnapshot, TerminalIdentity } from '../src/core/types.js';
+import { ScreenModel } from '../src/terminal/screen.js';
 
 const LABEL_ROOT = fixtureRoot('cache-recorder');
 const CASES_ROOT = join(LABEL_ROOT, 'cases');
@@ -364,7 +365,13 @@ describe('ReadableRecorder', () => {
       return true;
     });
 
-    assert.deepEqual(await recorder.close({ remove: false }), { cacheRemoved: false });
+    const closed = await recorder.close({ remove: false });
+    assert.equal(closed.cacheRemoved, false);
+    assert.equal(closed.recordingErrorCode, 'CACHE_WRITE_FAILED');
+    assert.equal(closed.cacheMayBeIncomplete, true);
+    assert.equal(closed.droppedChunks, 1);
+    assert.equal(closed.droppedBytes, recorder.failed?.details.droppedBytes);
+    assert.ok(Number(closed.droppedBytes) > Buffer.byteLength(oversized, 'utf8'));
     const content = await readFile(recorder.path, 'utf8');
     assert.ok(content.includes('[CACHE ERROR] CACHE_WRITE_FAILED'), 'failure notice is visible on disk');
     assert.ok(content.includes('dropped_bytes='), 'notice states how much was dropped');
@@ -492,6 +499,8 @@ describe('ReadableRecorder', () => {
     await assert.rejects(settlesWithin(recorder.flush()), { code: 'CACHE_WRITE_FAILED' });
     const result = await settlesWithin(recorder.close({ remove: false }));
     assert.equal(result.cacheRemoved, false);
+    assert.equal(result.recordingErrorCode, 'CACHE_WRITE_FAILED');
+    assert.equal(result.cacheMayBeIncomplete, true);
   });
 });
 
@@ -551,4 +560,59 @@ it('R01 a failed initial cache header closes its handle and removes only its own
     // Rescue only this fixture on the pre-fix baseline; no foreign path is swept.
     if (existsSync(owned)) await unlink(owned);
   }
+});
+
+it('F02 records 300 NEL lines from ScreenModel into the cache without dropping lines or reporting 0 characters', async () => {
+  const root = caseRoot('nel-300');
+  const recorder = await ReadableRecorder.create(identity(), root);
+  const model = new ScreenModel({
+    nonce: 'nel-nonce',
+    cols: 80,
+    rows: 24,
+    onLine: l => recorder.recordLine(l),
+  });
+  recorder.beginRound();
+  recorder.markCommandStarted();
+  const total = 300;
+  const blob = Array.from({ length: total }, (_, i) => `ONE${String(i + 1).padStart(4, '0')}\x1bE`).join('');
+  await model.write(blob);
+  model.flushLine();
+  const result = await recorder.endRound(0);
+  assert.equal(result.round, 'R1');
+  assert.equal(result.exitCode, 0);
+  // Command-start facts are attached by Session; the recorder returns counts
+  // and durable cache ranges, not an execution-state claim.
+  assert.equal(result.output, null);
+  assert.equal(result.outputCharacters, total * 8); // 'ONE0001\n' is 8 chars per line
+  assert.equal(result.outputOmitted, true, '2400 chars exceeds the 1000 codepoint preview limit');
+  const content = await readFile(recorder.path, 'utf8');
+  assert.ok(content.includes('| ONE0001\n'));
+  assert.ok(content.includes('| ONE0271\n'));
+  assert.ok(content.includes('| ONE0300\n'));
+  await recorder.close({ remove: true });
+  model.dispose();
+});
+
+it('F01 masks SGR 8 invisible text in ScreenModel before reaching cache and summary', async () => {
+  const root = caseRoot('sgr8-invisible');
+  const recorder = await ReadableRecorder.create(identity(), root);
+  const model = new ScreenModel({
+    nonce: 'sgr8-nonce',
+    cols: 80,
+    rows: 24,
+    onLine: l => recorder.recordLine(l),
+    onFrame: frame => recorder.recordFrame(frame),
+  });
+  recorder.beginRound();
+  recorder.markCommandStarted();
+  await model.write('\x1b[8mSECRET_CREDENTIAL\x1b[0m\r\n');
+  model.flushLine();
+  const result = await recorder.endRound(0);
+  assert.equal(result.output, ' '.repeat(17) + '\n');
+  assert.equal(result.output?.includes('SECRET_CREDENTIAL'), false, 'preview must not expose secret');
+  const content = await readFile(recorder.path, 'utf8');
+  assert.equal(content.includes('SECRET_CREDENTIAL'), false, 'cache log must not expose secret');
+  assert.ok(content.includes('| ' + ' '.repeat(17) + '\n'));
+  await recorder.close({ remove: true });
+  model.dispose();
 });

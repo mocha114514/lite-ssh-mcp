@@ -206,3 +206,41 @@ export async function assertGuards(
     }
   }
 }
+
+/**
+ * Verify that guards and metadata newly observed during resolvePath match
+ * the plan's expected guards. Newly observed metadata cannot be discarded:
+ * an external modification between assertGuards and resolvePath (or during
+ * path resolution) must be recognized and stopped with PATH_CHANGED.
+ */
+export function assertObservedGuards(
+  fs: TransferFileSystem,
+  observedGuards: Iterable<PathGuard>,
+  expectedGuards: Map<string, PathGuard>,
+  source: boolean
+): void {
+  for (const observed of observedGuards) {
+    const key = fs.key(observed.path);
+    const expected = expectedGuards.get(key);
+    if (!expected) {
+      throw new LiteSshError(
+        'PATH_CHANGED',
+        'An observable path, type, identity or link changed after planning. Scheduling stopped.',
+        { side: source ? 'source' : 'target', actualPath: observed.path }
+      );
+    }
+    const directoryChanged = source && expected.watchContents === true &&
+      expected.metadata?.kind === 'directory' && observed.metadata?.kind === 'directory' &&
+      (observed.metadata.mtime !== expected.metadata.mtime ||
+       observed.metadata.mtimeExact !== expected.metadata.mtimeExact ||
+       observed.metadata.size !== expected.metadata.size);
+    if (!sameMetadata(expected.metadata, observed.metadata) || directoryChanged ||
+        (expected.linkTarget !== undefined && observed.linkTarget !== expected.linkTarget)) {
+      throw new LiteSshError(
+        'PATH_CHANGED',
+        'An observable path, type, identity or link changed after planning. Scheduling stopped.',
+        { side: source ? 'source' : 'target', actualPath: observed.path }
+      );
+    }
+  }
+}

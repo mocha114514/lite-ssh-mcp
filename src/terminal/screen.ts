@@ -63,6 +63,13 @@
  *    continuation rows as `wrapped: true` fragments followed by the terminating
  *    row as `wrapped: false`. This is exact even across thousands of lines in a
  *    single packet.
+ *  - `registerEscHandler` catches non-LF newlines and indexing: NEL (`ESC E`)
+ *    and IND (`ESC D`). xterm does not fire `onLineFeed` for these escape
+ *    sequences; without synchronous interception, high-volume batches (e.g. 300
+ *    NEL lines in a single write) scroll into scrollback uncaptured, losing
+ *    history on eviction and reporting 0 output characters. Capturing the row
+ *    before xterm executes the sequence guarantees log integrity across
+ *    arbitrary batching and chunking.
  *  - `onScroll` also fires as a still-growing line pushes rows off the top (a
  *    soft wrap with no LF). When the cursor row is a wrapped continuation, the
  *    complete rows above it are emitted as continuations before trimming can
@@ -219,6 +226,26 @@ export class ScreenModel {
         this.flushLine();
         this.onFrame?.(this.buildSnapshot(), 'cursor-restore');
         this.preserveAddressedRows(this.terminal.buffer.active);
+        return false;
+      }),
+      // NEL (Next Line, ESC E): Moves cursor to column 0 of next line (and scrolls if at bottom).
+      // Unlike LF, xterm does not fire onLineFeed for ESC E. Capture the completed line
+      // synchronously before xterm's native handler advances or scrolls the buffer, so
+      // lines are not lost to scrollback eviction and log integrity is preserved.
+      this.terminal.parser.registerEscHandler({ final: 'E' }, () => {
+        if (this.disposed) return false;
+        this.rewriteControlOnly = true;
+        const buffer = this.terminal.buffer.active;
+        this.captureUpTo(buffer.baseY + buffer.cursorY, true);
+        return false;
+      }),
+      // IND (Index, ESC D): Moves cursor down one row in same column (and scrolls if at bottom).
+      // Synchronously capture the completed row so non-LF indexing does not drop output.
+      this.terminal.parser.registerEscHandler({ final: 'D' }, () => {
+        if (this.disposed) return false;
+        this.rewriteControlOnly = true;
+        const buffer = this.terminal.buffer.active;
+        this.captureUpTo(buffer.baseY + buffer.cursorY, true);
         return false;
       }),
       // Cursor addressing can replace cells without CR/BS or erase. Preserve
@@ -440,7 +467,9 @@ export class ScreenModel {
   /**
    * Scroll handler: a soft wrap (no LF) leaves the cursor row marked `isWrapped`,
    * so every row above it is complete and may be evicted at any moment. They are
-   * emitted as continuations before trimming can reach them.
+   * emitted as continuations before trimming can reach them. (LF and NEL/IND
+   * newlines are handled synchronously by their respective linefeed/escape
+   * handlers, ensuring no duplicate lines or missed rows during scrolling).
    */
   private onScroll(): void {
     if (this.disposed) return;
@@ -793,6 +822,13 @@ function styleKey(style: CellStyle): string {
  * That preserves meaningful trailing spaces at a soft-wrap boundary (e.g.
  * `x` + 79 spaces + `y`), and `translateToString(false, 0, end)` then keeps wide
  * characters intact because xterm advances by the cell width.
+ *
+ * When any cells have the invisible attribute (SGR 8, `isInvisible() !== 0`),
+ * their raw text is masked with spaces preserving their exact display column width
+ * (e.g. 2 spaces for wide characters, 1 space for standard/combining characters).
+ * This prevents leaking sensitive credentials or concealed input into screen
+ * snapshots, command summaries, or readable cache logs, while maintaining column
+ * alignment for subsequent visible characters.
  */
 function readableRow(line: IBufferLine, cols: number, nullCell: IBufferCell): string {
   let end = cols;
@@ -801,7 +837,42 @@ function readableRow(line: IBufferLine, cols: number, nullCell: IBufferCell): st
     if (cell && (cell.getCode() !== 0 || cell.getChars().length > 0)) break;
     end -= 1;
   }
-  return end === 0 ? '' : line.translateToString(false, 0, end);
+  if (end === 0) return '';
+
+  let hasInvisible = false;
+  for (let x = 0; x < end; x++) {
+    const cell = line.getCell(x, nullCell);
+    if (cell && cell.isInvisible() !== 0) {
+      hasInvisible = true;
+      break;
+    }
+  }
+  if (!hasInvisible) {
+    return line.translateToString(false, 0, end);
+  }
+
+  let text = '';
+  for (let x = 0; x < end; ) {
+    const cell = line.getCell(x, nullCell);
+    if (!cell) {
+      text += ' ';
+      x += 1;
+      continue;
+    }
+    const width = cell.getWidth();
+    if (cell.isInvisible() !== 0) {
+      // Cell is masked due to invisible attribute (SGR 8).
+      // Preserve column width: wide characters (width 2) become 2 spaces,
+      // normal characters / combining marks (width 1) become 1 space.
+      const step = width || 1;
+      text += ' '.repeat(step);
+      x += step;
+    } else {
+      text += cell.getChars() || ' ';
+      x += width || 1;
+    }
+  }
+  return text;
 }
 
 /** True when a DECSET/DECRST parameter list enables/disables the alternate screen. */

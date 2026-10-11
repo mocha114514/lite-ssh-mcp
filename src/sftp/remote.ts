@@ -2,7 +2,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Client, SFTPWrapper, Stats } from 'ssh2';
 import { LiteSshError } from '../core/errors.js';
-import type { Metadata, ReadHandle, TransferFileSystem, WriteHandle } from './filesystem.js';
+import { checkCancelled, type Metadata, type ReadHandle, type TransferFileSystem, type WriteHandle } from './filesystem.js';
+import { TRANSFER_LIMITS } from './types.js';
 
 export function normalizeRemotePath(value: string): string {
   if (!value.startsWith('/') || value.includes('\0') || value.length > 32_768) {
@@ -20,6 +21,13 @@ function metadata(stats: Stats): Metadata {
     mtime: stats.mtime * 1000,
     mode: stats.mode
   };
+}
+
+export interface RemoteOpenOptions {
+  /** Handshake timeout in ms, defaults to 15_000ms. Unit tests can inject short timeouts. */
+  timeoutMs?: number;
+  /** Narrow lifecycle callback receiving the pending cleanup ticket when open fails or times out. */
+  onPendingCleanup?: (cleanup: Promise<{ confirmed: boolean }>) => void;
 }
 
 /** One task owns one channel; ending it never ends a shared SSH client. */
@@ -48,24 +56,109 @@ export class RemoteFileSystem implements TransferFileSystem {
     channel.on('close', this.onClose);
     channel.on('error', this.onError);
   }
-  static async open(client: Client): Promise<RemoteFileSystem> {
+  static async open(client: Client, options?: RemoteOpenOptions): Promise<RemoteFileSystem> {
+    const timeoutMs = options?.timeoutMs ?? 15_000;
     const channel = await new Promise<SFTPWrapper>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
       let settled = false;
-      const timer = setTimeout(() => {
-        settled = true;
-        reject(new LiteSshError('SFTP_UNAVAILABLE', 'Opening the SFTP channel timed out.'));
-      }, 15_000);
-      try {
-        client.sftp((error, channel) => {
-          clearTimeout(timer);
-          if (settled) { channel?.end(); return; }
+      let cleanupResolved = false;
+      let lateChannel: SFTPWrapper | undefined;
+      let resolveCleanup!: (result: { confirmed: boolean }) => void;
+      const cleanupPromise = new Promise<{ confirmed: boolean }>(res => {
+        resolveCleanup = res;
+      });
+
+      const onLateChannelClose = (): void => {
+        triggerConfirm();
+      };
+
+      const triggerConfirm = (): void => {
+        if (cleanupResolved) return;
+        cleanupResolved = true;
+        client.removeListener('close', onClientClose);
+        if (lateChannel) {
+          lateChannel.removeListener('close', onLateChannelClose);
+        }
+        resolveCleanup({ confirmed: true });
+      };
+
+      const notifyPendingCleanup = (): void => {
+        try {
+          options?.onPendingCleanup?.(cleanupPromise);
+        } catch {
+          // Do not let synchronous throw in onPendingCleanup escape or cause unhandled rejections
+        }
+      };
+
+      const onClientClose = (): void => {
+        triggerConfirm();
+        if (!settled) {
           settled = true;
-          if (error) reject(new LiteSshError('SFTP_UNAVAILABLE', 'The server could not open an SFTP channel.'));
-          else resolve(channel);
+          if (timer !== undefined) clearTimeout(timer);
+          notifyPendingCleanup();
+          reject(new LiteSshError(
+            'SFTP_UNAVAILABLE',
+            'The SSH client closed before the SFTP channel became ready.',
+            { cleanupPending: !cleanupResolved }
+          ));
+        }
+      };
+
+      // Synchronously register pre-listener on client before calling client.sftp.
+      // timer is declared above so there is no TDZ even if 'close' fires synchronously.
+      client.once('close', onClientClose);
+
+      timer = setTimeout(() => {
+        settled = true;
+        notifyPendingCleanup();
+        reject(new LiteSshError(
+          'SFTP_UNAVAILABLE',
+          'Opening the SFTP channel timed out.',
+          { cleanupPending: !cleanupResolved }
+        ));
+      }, timeoutMs);
+
+      try {
+        client.sftp((error, chan) => {
+          if (timer !== undefined) clearTimeout(timer);
+          if (settled) {
+            if (chan) {
+              lateChannel = chan;
+              chan.once('close', onLateChannelClose);
+              try {
+                chan.end();
+              } catch {
+                // channel.end() throw is not closure: keep waiting for chan.close or client.close
+              }
+            }
+            return;
+          }
+          settled = true;
+          if (error) {
+            if (chan) {
+              lateChannel = chan;
+              chan.once('close', onLateChannelClose);
+              try {
+                chan.end();
+              } catch {
+                // channel.end() throw is not closure: keep waiting for chan.close or client.close
+              }
+            }
+            notifyPendingCleanup();
+            reject(new LiteSshError(
+              'SFTP_UNAVAILABLE',
+              'The server could not open an SFTP channel.',
+              { cleanupPending: !cleanupResolved }
+            ));
+          } else {
+            client.removeListener('close', onClientClose);
+            resolve(chan);
+          }
         });
       } catch {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
         settled = true;
+        client.removeListener('close', onClientClose);
         reject(new LiteSshError('SFTP_UNAVAILABLE', 'The server could not open an SFTP channel.'));
       }
     });
@@ -119,10 +212,13 @@ export class RemoteFileSystem implements TransferFileSystem {
     }
   }
   readlink(value: string): Promise<string> { return this.request(done => this.channel.readlink(value, done)); }
-  async *entries(value: string): AsyncIterable<string> {
+  async *entries(value: string, signal?: AbortSignal): AsyncIterable<string> {
+    if (signal) checkCancelled(signal);
     const handle = await this.request<Buffer>(done => this.channel.opendir(value, done));
+    let emptyBatches = 0;
     try {
       for (;;) {
+        if (signal) checkCancelled(signal);
         const batch = await this.request<import('ssh2').FileEntryWithStats[] | false>(done => {
           // The public handle overload reports STATUS EOF as an error, unlike
           // the path overload which collects all entries internally.
@@ -131,8 +227,25 @@ export class RemoteFileSystem implements TransferFileSystem {
             else done(error, entries);
           });
         });
-        if (batch === false || batch.length === 0) break;
-        for (const entry of batch) if (entry.filename !== '.' && entry.filename !== '..') yield entry.filename;
+        if (signal) checkCancelled(signal);
+        if (batch === false) break;
+        // ssh2 filters '.' and '..' from NAME replies. An empty filtered
+        // batch is not STATUS EOF: keep reading instead of losing later files.
+        // Bound no-progress replies as well as the planner's actual entries,
+        // so a peer cannot keep an empty generator busy forever.
+        let hasEntries = false;
+        for (const entry of batch) {
+          if (entry.filename === '.' || entry.filename === '..') continue;
+          hasEntries = true;
+          yield entry.filename;
+        }
+        if (!hasEntries && ++emptyBatches > TRANSFER_LIMITS.entries) {
+          throw new LiteSshError(
+            'RESOURCE_LIMIT',
+            'Directory enumeration exceeded its empty-reply budget before EOF.',
+            { resource: 'emptyDirectoryBatches', limit: TRANSFER_LIMITS.entries }
+          );
+        }
       }
     } finally { await this.request<void>(done => this.channel.close(handle, error => done(error, undefined))); }
   }

@@ -87,6 +87,11 @@ async function ensureRoot(root: string): Promise<void> {
 export interface CloseResult {
   cacheRemoved: boolean;
   cleanupError?: string;
+  recordingErrorCode?: string;
+  cacheMayBeIncomplete?: boolean;
+  reason?: string;
+  droppedChunks?: number;
+  droppedBytes?: number;
 }
 
 export class ReadableRecorder {
@@ -331,7 +336,7 @@ export class ReadableRecorder {
    * `output: null` / `outputOmitted: true`; the full readable history stays on
    * disk and is located by `cacheRange`.
    */
-  async endRound(exitCode: number): Promise<RoundResult> {
+  async endRound(exitCode: number, options?: { commandStartUnknown?: boolean }): Promise<RoundResult> {
     const round = this.round;
     if (!round) {
       throw new LiteSshError('ROUND_NOT_OPEN', 'No cache round is open; call beginRound before endRound.');
@@ -340,7 +345,10 @@ export class ReadableRecorder {
       throw new LiteSshError('INVALID_EXIT_CODE', 'exitCode must be an integer.');
     }
     this.metadataBoundary(); // END marker must own its physical line.
-    this.enqueue(`${roundEndLine(round.id, exitCode)}\n`);
+    const endLine = options?.commandStartUnknown
+      ? `${roundEndLine(round.id, exitCode)} commandStartUnknown=true\n`
+      : `${roundEndLine(round.id, exitCode)}\n`;
+    this.enqueue(endLine);
     this.round = undefined;
     await this.flush(); // Result is only returned once the range is durable.
 
@@ -352,12 +360,18 @@ export class ReadableRecorder {
       output: omitted ? null : round.preview.join(''),
       outputOmitted: omitted,
       cacheRange: { beginMarker: round.beginMarker, endMarker: round.endMarker },
+      ...(options?.commandStartUnknown ? { commandStartUnknown: true } : {}),
     };
   }
 
   /** Resolve once every enqueued write is on disk; rejects on `CACHE_WRITE_FAILED`. */
   async flush(): Promise<void> {
     await this.queue.flush();
+  }
+
+  /** Sticky write queue failure, if any has occurred. */
+  get failed(): LiteSshError | undefined {
+    return this.queue.failed;
   }
 
   /**
@@ -370,12 +384,21 @@ export class ReadableRecorder {
     this.closed = true;
     const remove = options?.remove ?? true;
     let cleanupError: string | undefined;
+    let recordingError: LiteSshError | undefined;
 
     try {
       await this.queue.flush();
-    } catch {
-      /* Write failure was already surfaced by flush()/endRound() and on disk. */
+    } catch (error) {
+      recordingError = error instanceof LiteSshError ? error : new LiteSshError(
+        'CACHE_WRITE_FAILED',
+        'A cache write to disk failed; readable history may be incomplete.',
+        { reason: reasonCode(error) }
+      );
     }
+    if (!recordingError && this.queue.failed) {
+      recordingError = this.queue.failed;
+    }
+
     let cacheRemoved = false;
     if (remove) {
       try {
@@ -394,7 +417,19 @@ export class ReadableRecorder {
       cleanupError = `CACHE_WRITE_FAILED close:${reasonCode(error)}`;
     }
 
-    this.closeResult = cleanupError === undefined ? { cacheRemoved } : { cacheRemoved, cleanupError };
+    const result: CloseResult = {
+      cacheRemoved,
+      ...(cleanupError !== undefined ? { cleanupError } : {}),
+      ...(recordingError ? {
+        recordingErrorCode: recordingError.code,
+        cacheMayBeIncomplete: true,
+        ...(typeof recordingError.details?.reason === 'string' ? { reason: recordingError.details.reason } : {}),
+        ...(typeof recordingError.details?.droppedChunks === 'number' ? { droppedChunks: recordingError.details.droppedChunks } : {}),
+        ...(typeof recordingError.details?.droppedBytes === 'number' ? { droppedBytes: recordingError.details.droppedBytes } : {}),
+      } : {}),
+    };
+
+    this.closeResult = result;
     return this.closeResult;
   }
 

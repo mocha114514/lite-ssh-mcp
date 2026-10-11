@@ -5,7 +5,7 @@ import type { ConnectionLease, PageOptions } from '../core/types.js';
 import type { ConnectionPool } from '../ssh/pool.js';
 import { fileError, type TransferFileSystem } from './filesystem.js';
 import { LocalFileSystem, normalizeLocalPath } from './local.js';
-import { RemoteFileSystem, normalizeRemotePath } from './remote.js';
+import { RemoteFileSystem, normalizeRemotePath, type RemoteOpenOptions } from './remote.js';
 import { planTransfer, type PlannedEntry, type TransferPlan } from './planner.js';
 import { runTransfer, type CleanupResult, type RunOutcome, type TransferProgress, type EntryResult } from './runner.js';
 import { isTerminalPhase, policiesOf, TRANSFER_LIMITS, type TransferDirection, type TransferLimits, type TransferPhase, type TransferPolicies, type TransferRequest } from './types.js';
@@ -20,7 +20,11 @@ export interface TransferManagerOptions {
   memoryBytes?: number;
   now?: () => number;
   local?: () => TransferFileSystem;
-  remote?: (client: ConnectionLease['client']) => Promise<OwnedRemoteFileSystem>;
+  remote?: (
+    client: ConnectionLease['client'],
+    options?: RemoteOpenOptions
+  ) => Promise<OwnedRemoteFileSystem>;
+  openTimeoutMs?: number;
 }
 interface Task {
   transferId: string;
@@ -109,10 +113,21 @@ export class TransferManager {
     let lease: ConnectionLease | undefined;
     let remote: OwnedRemoteFileSystem | undefined;
     let registered = false;
+    let pendingCleanup: Promise<{ confirmed: boolean }> | undefined;
+    let releasedAdmission = false;
+    const releaseFailedAdmission = (): void => {
+      if (releasedAdmission) return;
+      releasedAdmission = true;
+      this.admitted--;
+      this.memoryUsed -= baseBytes;
+    };
     try {
       lease = await this.pool.acquire(request);
       if (this.stopping) throw new LiteSshError('SERVER_STOPPING', 'The MCP instance is shutting down.');
-      remote = await (this.options.remote ?? RemoteFileSystem.open)(lease.client);
+      remote = await (this.options.remote ?? RemoteFileSystem.open)(lease.client, {
+        timeoutMs: this.options.openTimeoutMs,
+        onPendingCleanup: cleanup => { pendingCleanup = cleanup; }
+      });
       if (this.stopping) throw new LiteSshError('SERVER_STOPPING', 'The MCP instance is shutting down.');
       const local = (this.options.local ?? (() => new LocalFileSystem()))();
       let resolveCompletion!: () => void;
@@ -136,7 +151,19 @@ export class TransferManager {
         try { if (remote) await remote.dispose(); }
         finally {
           try { if (lease) await lease.release(); }
-          finally { this.admitted--; this.memoryUsed -= baseBytes; }
+          finally {
+            if (pendingCleanup) {
+              void pendingCleanup.then(result => {
+                if (result?.confirmed === true) {
+                  releaseFailedAdmission();
+                }
+              }).catch(() => {
+                // Unknown reject does not release budget
+              });
+            } else {
+              releaseFailedAdmission();
+            }
+          }
         }
       }
     }
@@ -367,9 +394,11 @@ export class TransferManager {
         if (!isTerminalPhase(task.phase) && !task.finishing) this.cancel(task.transferId);
       }
       await Promise.all([...this.tasks.values()].map(task => task.completion));
+      for (const task of this.tasks.values()) {
+        this.memoryUsed -= task.accountedBytes;
+      }
       this.tasks.clear();
       this.expired.clear();
-      this.memoryUsed = 0;
     })();
     return this.closing;
   }

@@ -861,3 +861,206 @@ test('R01 narrowing into a wide-cell continuation does not drop its replacement 
     assert.ok(h.lines.map(line => line.text).join('').includes('X'));
   } finally { h.model.dispose(); }
 });
+
+test('F02 single write batch of 300 NEL (ESC E) lines preserves all 300 lines without history loss', async () => {
+  const h = harness(80, 24);
+  try {
+    const total = 300;
+    const blob = Array.from({ length: total }, (_, i) => `ONE${String(i + 1).padStart(4, '0')}\x1bE`).join('');
+    await h.model.write(blob);
+    h.model.flushLine();
+    assert.equal(h.lines.length, total, 'all 300 NEL lines must be captured, not losing 271 to scrollback eviction');
+    assert.equal(h.lines[0]?.text, 'ONE0001');
+    assert.equal(h.lines[270]?.text, 'ONE0271');
+    assert.equal(h.lines[total - 1]?.text, `ONE${String(total).padStart(4, '0')}`);
+    assert.ok(h.lines.every(l => l.wrapped === false && l.newline === true), 'each NEL must be a hard terminating newline');
+    assert.ok(h.lines.every(l => l.buffer === 'normal'));
+  } finally { h.model.dispose(); }
+});
+
+test('F02 byte-by-byte chunking of 300 NEL (ESC E) lines captures every line in exact order', async () => {
+  const h = harness(80, 24);
+  try {
+    const total = 300;
+    const blob = Array.from({ length: total }, (_, i) => `ONE${String(i + 1).padStart(4, '0')}\x1bE`).join('');
+    for (let i = 0; i < blob.length; i++) {
+      await h.model.write(blob.charAt(i));
+    }
+    h.model.flushLine();
+    assert.equal(h.lines.length, total, 'byte-by-byte streaming must not drop lines across split ESC E chunks');
+    assert.equal(h.lines[0]?.text, 'ONE0001');
+    assert.equal(h.lines[total - 1]?.text, `ONE${String(total).padStart(4, '0')}`);
+    assert.ok(h.lines.every((l, i) => l.text === `ONE${String(i + 1).padStart(4, '0')}`));
+    assert.ok(h.lines.every(l => l.wrapped === false && l.newline === true));
+  } finally { h.model.dispose(); }
+});
+
+test('F01 SGR 8 invisible text masks raw text while preserving wide character column width and alignment', async () => {
+  const h = harness(80, 24);
+  try {
+    // Two CJK wide characters (width 2 each, 4 columns total) with SGR 8 invisible, followed by visible CJK text
+    await h.model.write('\x1b[8m密码\x1b[0m可见\r\n');
+    h.model.flushLine();
+    const snapshot = h.model.snapshot();
+    const line0 = snapshot.lines[0] ?? '';
+    assert.ok(line0.startsWith('    可见'), 'invisible wide characters must be masked as 4 spaces, preserving column alignment');
+    assert.equal(line0.indexOf('可'), 4, 'subsequent visible text must align at column index 4');
+    assert.equal(line0.includes('密码'), false, 'secret text must not be revealed in screen lines');
+    assert.equal(h.lines[0]?.text, '    可见', 'captured line must contain masked spaces instead of secret text');
+    assert.equal(h.lines[0]?.text.includes('密码'), false, 'secret text must not be emitted to line callbacks');
+    // Styles must still report invisible: true for the first 4 columns
+    assert.ok(snapshot.styles.some(s => s.row === 0 && s.start === 0 && s.end === 4 && s.style.invisible === true));
+  } finally { h.model.dispose(); }
+});
+
+test('F01 SGR 8 invisible combining marks mask original characters with column width 1', async () => {
+  const h = harness(80, 24);
+  try {
+    await h.model.write('\x1b[8me\u0301\x1b[0mOK\r\n');
+    h.model.flushLine();
+    const snapshot = h.model.snapshot();
+    const line0 = snapshot.lines[0] ?? '';
+    assert.ok(line0.startsWith(' OK'), 'invisible combining glyph (width 1) must be masked as 1 space');
+    assert.equal(line0.indexOf('O'), 1, 'visible text must align at column index 1');
+    assert.equal(line0.includes('e\u0301'), false, 'secret combining mark must not appear in screen lines');
+    assert.equal(h.lines[0]?.text, ' OK');
+  } finally { h.model.dispose(); }
+});
+
+test('F01 comparison: SGR 8 invisible vs no-echo input both protect sensitive plaintext', async () => {
+  const hNoEcho = harness(80, 24);
+  const hSgr8 = harness(80, 24);
+  try {
+    // In no-echo mode, the remote shell / pty does not echo characters to the terminal at all
+    await hNoEcho.model.write('Password: ');
+    // Simulated secret typing under no-echo: nothing written to terminal emulator
+    await hNoEcho.model.write('\r\naccepted\r\n');
+    hNoEcho.model.flushLine();
+    assert.equal(hNoEcho.lines.some(l => l.text.includes('synthetic_password')), false, 'no-echo does not echo');
+
+    // In SGR 8 invisible mode, characters are written with invisible attribute
+    await hSgr8.model.write('Password: \x1b[8msynthetic_password\x1b[0m\r\naccepted\r\n');
+    hSgr8.model.flushLine();
+    assert.equal(hSgr8.lines.some(l => l.text.includes('synthetic_password')), false, 'SGR 8 masks invisible cells');
+    assert.ok(hSgr8.lines[0]?.text.startsWith('Password: ' + ' '.repeat(18)), 'cells masked as spaces matching length');
+    const snapshot = hSgr8.model.snapshot();
+    assert.ok(snapshot.styles.some(s => s.style.invisible === true), 'styles record invisible: true');
+  } finally {
+    hNoEcho.model.dispose();
+    hSgr8.model.dispose();
+  }
+});
+
+test('F02 non-LF indexing with IND (ESC D) captures completed lines across scroll', async () => {
+  const h = harness(80, 5);
+  try {
+    for (let i = 1; i <= 10; i++) {
+      await h.model.write(`IND${i}\x1bD`);
+    }
+    h.model.flushLine();
+    assert.equal(h.lines.length, 10, 'all 10 IND lines must be captured');
+    assert.equal(h.lines[0]?.text, 'IND1');
+    assert.equal(h.lines[9]?.text, ' '.repeat(36) + 'IND10', 'IND maintains cursor column across lines per VT semantics');
+    assert.ok(h.lines.every(l => l.wrapped === false && l.newline === true));
+  } finally { h.model.dispose(); }
+});
+
+test('RI baseline: a top-margin insert and unchanged revisit do not duplicate text', async () => {
+  const h = harness(80, 3);
+  try {
+    // Write 'A' on row 0, then RI at top margin (inserts blank row at top, shifts 'A' to row 1),
+    // then move cursor down to row 1 (\x1b[B) without rewriting
+    await h.model.write('A\x1bM\x1b[B');
+    h.model.flushLine();
+    const text = h.lines.map(l => l.text).join('');
+    assert.equal(text, 'A', 'RI baseline migration must not duplicate A on non-rewriting visit');
+    assert.equal(h.lines.filter(l => l.text.includes('A')).length, 1);
+  } finally { h.model.dispose(); }
+});
+
+test('F02 NEL stream exceeding scrollback (11000 lines) captures every line without loss or memory explosion', async () => {
+  const h = harness(80, 24);
+  try {
+    const total = 11_000;
+    const batchSize = 1000;
+    for (let batchStart = 0; batchStart < total; batchStart += batchSize) {
+      const count = Math.min(batchSize, total - batchStart);
+      const blob = Array.from({ length: count }, (_, i) => `N${String(batchStart + i + 1).padStart(5, '0')}\x1bE`).join('');
+      await h.model.write(blob);
+    }
+    h.model.flushLine();
+    assert.equal(h.lines.length, total, 'all 11000 lines must be captured, far beyond xterm default scrollback');
+    assert.equal(h.lines[0]?.text, 'N00001');
+    assert.equal(h.lines[total - 1]?.text, `N${String(total).padStart(5, '0')}`);
+    assert.ok(h.lines.every(l => l.wrapped === false && l.newline === true));
+  } finally { h.model.dispose(); }
+});
+
+test('F01 SGR 8 invisible text across soft-wrap and resize maintains column masking and alignment', async () => {
+  const h = harness(10, 4);
+  try {
+    // 10-column terminal. Invisible 6 chars + visible 6 chars wraps to next line.
+    await h.model.write('\x1b[8mSECRET\x1b[0mWRAPME\r\n');
+    h.model.flushLine();
+    const joined = h.lines.map(l => l.text).join('');
+    assert.equal(joined, '      WRAPME', 'invisible text masked with 6 spaces across wrap boundary');
+    assert.equal(joined.includes('SECRET'), false);
+
+    // Resize to 20 columns
+    h.model.resize(20, 4);
+    await h.model.write('\x1b[8m密码\x1b[0mOK\r\n');
+    h.model.flushLine();
+    const lastLine = h.lines.at(-1)?.text ?? '';
+    assert.equal(lastLine, '    OK', 'invisible wide characters masked with 4 spaces after resize');
+    assert.equal(lastLine.indexOf('O'), 4);
+    assert.equal(lastLine.includes('密码'), false);
+  } finally { h.model.dispose(); }
+});
+
+test('F02 mixed stream of normal LF, CR overwrite, auto-wrap, and NEL does not duplicate or drop', async () => {
+  const h = harness(10, 4);
+  try {
+    // 1. Normal LF
+    await h.model.write('NORMAL\r\n');
+    // 2. CR overwrite
+    await h.model.write('OLD\rNEW\r\n');
+    // 3. Auto-wrap (10 cols: 10 chars + 5 chars + NEL)
+    await h.model.write('0123456789WRAP1\x1bE');
+    // 4. Standalone NEL
+    await h.model.write('NEL_LINE\x1bE');
+    h.model.flushLine();
+
+    const texts = h.lines.map(l => l.text);
+    assert.ok(texts.includes('NORMAL'), 'LF line present');
+    assert.ok(texts.includes('OLD') && texts.includes('NEW'), 'CR overwrite preserved');
+    assert.ok(texts.includes('0123456789') && texts.includes('WRAP1'), 'auto-wrap preserved');
+    assert.ok(texts.includes('NEL_LINE'), 'NEL line present');
+    // No duplication of NORMAL or NEL_LINE
+    assert.equal(texts.filter(t => t === 'NORMAL').length, 1);
+    assert.equal(texts.filter(t => t === 'NEL_LINE').length, 1);
+  } finally { h.model.dispose(); }
+});
+
+for (const prefix of ['', '\x1b[?1049h']) {
+  const bufferName = prefix ? 'alternate' : 'normal';
+  test(`RI ${bufferName}: a newly inserted row remains readable after prior flush`, async () => {
+    const h = harness(80, 3);
+    try {
+      await h.model.write(prefix + 'A');
+      h.model.flushLine();
+      await h.model.write('\x1bMZ');
+      h.model.flushLine();
+      const text = h.lines.map(line => line.text).join('');
+      assert.equal(text.split('A').length - 1, 1);
+      assert.equal(text.split('Z').length - 1, 1);
+    } finally { h.model.dispose(); }
+  });
+  test(`RI ${bufferName}: a custom scroll-region revisit does not repeat unchanged text`, async () => {
+    const h = harness(80, 4);
+    try {
+      await h.model.write(prefix + '\x1b[2;4r\x1b[2;1HA\x1bM\x1b[B');
+      h.model.flushLine();
+      assert.equal(h.lines.map(line => line.text).join(''), 'A');
+    } finally { h.model.dispose(); }
+  });
+}

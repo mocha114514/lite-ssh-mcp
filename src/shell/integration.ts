@@ -113,8 +113,12 @@ function bashBootstrap(nonce: string, savedStty: string): string {
   // $? is captured on the first line, before our printf can clobber it.
   const precmd =
     id + 'precmd() { local ' + id + 'ec=$?; ' +
+    'local ' + id + 'ps0="${PS0-}"; ' +
+    'local ' + id + 'h=0; ' +
+    'if [ -n "$' + id + 'ps0" ] && [ "${' + id + 'ps0#$\'' + oscFormat(nonce, 'BEGIN') + '\'}" != "$' + id + 'ps0" ]; then ' +
+    id + 'h=1; fi; ' +
     'if [ "${' + id + 'ready}" = "1" ]; then ' +
-    'printf "' + oscFormat(nonce, 'END;%d') + '" "$' + id + 'ec"; ' +
+    'printf "' + oscFormat(nonce, 'END;%d;%d') + '" "$' + id + 'ec" "$' + id + 'h"; ' +
     'else ' + id + 'ready=1; printf "' + oscFormat(nonce, 'READY;bash') + '"; fi; ' +
     'return $' + id + 'ec; }';
   // `case` on `declare -p` output avoids depending on grep being present.
@@ -169,8 +173,10 @@ function zshBootstrap(nonce: string, savedStty: string): string {
   const preexec = id + 'preexec() { printf "' + oscFormat(nonce, 'BEGIN') + '"; }';
   const precmd =
     'precmd() { local ' + id + 'ec=$?; ' +
+    'local ' + id + 'h=0; ' +
+    'if (( $+functions[' + id + 'preexec] )) && (( $+preexec_functions )) && (( ${preexec_functions[(Ie)' + id + 'preexec]} )); then ' + id + 'h=1; fi; ' +
     'if (( ' + id + 'ready )); then ' +
-    'printf "' + oscFormat(nonce, 'END;%d') + '" "$' + id + 'ec"; ' +
+    'printf "' + oscFormat(nonce, 'END;%d;%d') + '" "$' + id + 'ec" "$' + id + 'h"; ' +
     'else ' + id + 'ready=1; printf "' + oscFormat(nonce, 'READY;zsh') + '"; fi; ' +
     'if (( $+functions[' + id + 'orig_precmd] )); then ' +
     'if ' + id + 'ret "$' + id + 'ec"; then ' + id + 'orig_precmd; else ' + id + 'orig_precmd; fi; ' +
@@ -208,7 +214,7 @@ function zshBootstrap(nonce: string, savedStty: string): string {
 function fishBootstrap(nonce: string, savedStty: string): string {
   const id = '__lssh_' + identifier(nonce) + '_';
   const begin = 'printf "' + oscFormat(nonce, 'BEGIN') + '"';
-  const end = 'printf "' + oscFormat(nonce, 'END;%d') + '" $' + id + 'ec';
+  const end = 'printf "' + oscFormat(nonce, 'END;%d;%d') + '" $' + id + 'ec $' + id + 'h';
   const readyPrint = 'printf "' + oscFormat(nonce, 'READY;fish') + '"';
   const preexec =
     'function ' + id + 'preexec --on-event fish_preexec; ' + begin + '; ' +
@@ -216,6 +222,8 @@ function fishBootstrap(nonce: string, savedStty: string): string {
   const postexec =
     'function ' + id + 'postexec --on-event fish_postexec; ' +
     'set -l ' + id + 'ec $status; ' +
+    'set -l ' + id + 'h 0; ' +
+    'if functions -q ' + id + 'preexec; and string match -q -r \'^function[[:space:]]+.*--on-event[[:space:]]+fish_preexec\' (functions ' + id + 'preexec 2>/dev/null); set ' + id + 'h 1; end; ' +
     'if test $' + id + 'ready -eq 0; set -g ' + id + 'ready 1; set -g ' + id + 'round 0; ' +
     readyPrint + '; else; ' +
     'if test $' + id + 'round -eq 1; ' + end + '; set -g ' + id + 'round 0; end; ' +
@@ -223,6 +231,8 @@ function fishBootstrap(nonce: string, savedStty: string): string {
   const posterror =
     'function ' + id + 'posterror --on-event fish_posterror; ' +
     'set -l ' + id + 'ec $status; ' +
+    'set -l ' + id + 'h 0; ' +
+    'if functions -q ' + id + 'preexec; and string match -q -r \'^function[[:space:]]+.*--on-event[[:space:]]+fish_preexec\' (functions ' + id + 'preexec 2>/dev/null); set ' + id + 'h 1; end; ' +
     'if test $' + id + 'ready -eq 0; set -g ' + id + 'ready 1; set -g ' + id + 'round 0; ' +
     readyPrint + '; else; ' +
     // No BEGIN: parser-rejected input never ran, so there is no real round start.

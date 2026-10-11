@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { LiteSshError } from '../core/errors.js';
 import { checkCancelled, fileError, sameMetadata, type Metadata, type ReadHandle, type TransferFileSystem, type WriteHandle } from './filesystem.js';
-import { assertGuards, resolvePath, type PathGuard } from './paths.js';
+import { assertGuards, assertObservedGuards, resolvePath, type PathGuard } from './paths.js';
 import type { PlannedEntry, TransferPlan } from './planner.js';
 import type { TransferLimits, TransferPhase, TransferPolicies } from './types.js';
 
@@ -67,6 +67,11 @@ export async function runTransfer(
         targetFs.key(target.actualPath) !== targetFs.key(entry.actualTargetPath)) {
       throw new LiteSshError('PATH_CHANGED', 'A logical-to-actual path mapping changed after planning.');
     }
+    // Newly observed metadata and guards cannot be discarded: any change in
+    // identity, size, mtime or link target observed during path resolution
+    // must be reconciled with expected guards and halt execution immediately.
+    assertObservedGuards(sourceFs, source.guards, plan.sourceGuards, true);
+    assertObservedGuards(targetFs, target.guards, plan.targetGuards, false);
   };
   const cleanupTemporary = async (entry: PlannedEntry, temporary: string, expected?: Metadata): Promise<void> => {
     try {

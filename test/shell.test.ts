@@ -17,6 +17,7 @@ import {
   makeShellBootstrap,
   makeShellProbe,
 } from '../src/shell/integration.js';
+import { parseMarker } from '../src/shell/protocol.js';
 
 const NONCE = 'abc123';
 /** Identifier fragment the generator derives from {@link NONCE}. */
@@ -206,4 +207,52 @@ test('every bootstrap marker carries the nonce and printable escapes', () => {
     assert.ok(script.includes('\\033]777;LSSH;' + NONCE + ';'), shell);
     assert.ok(script.includes('\\007'), shell);
   }
+});
+
+test('F03 parseMarker preserves legacy END shape and decodes explicit hook health', () => {
+  assert.deepEqual(parseMarker('LSSH;test;END;0', 'test'), {
+    nonce: 'test',
+    kind: 'end',
+    exitCode: 0,
+  });
+  assert.deepEqual(parseMarker('LSSH;test;END;0;1', 'test'), {
+    nonce: 'test',
+    kind: 'end',
+    exitCode: 0,
+    hookHealthy: true,
+  });
+  assert.deepEqual(parseMarker('LSSH;test;END;0;0', 'test'), {
+    nonce: 'test',
+    kind: 'end',
+    exitCode: 0,
+    hookHealthy: false,
+  });
+  assert.deepEqual(parseMarker('LSSH;test;END;130;1', 'test'), {
+    nonce: 'test',
+    kind: 'end',
+    exitCode: 130,
+    hookHealthy: true,
+  });
+});
+
+test('F03 bash bootstrap checks installed PS0 prefix for hook health without promptvars dependency', () => {
+  const script = makeShellBootstrap('bash', NONCE, '');
+  assert.ok(!script.includes('shopt -q promptvars'));
+  assert.ok(script.includes('local ' + ID + 'ps0="${PS0-}";'));
+  assert.ok(script.includes('"${' + ID + 'ps0#$\'\\033]777;LSSH;' + NONCE + ';BEGIN\\007\'}" != "$' + ID + 'ps0"'));
+  assert.ok(script.includes('END;%d;%d'));
+});
+
+test('F03 zsh bootstrap checks function definition and preexec_functions binding for hook health', () => {
+  const script = makeShellBootstrap('zsh', NONCE, '');
+  assert.ok(script.includes('$+functions[' + ID + 'preexec]'));
+  assert.ok(script.includes('preexec_functions[(Ie)' + ID + 'preexec]'));
+  assert.ok(script.includes('END;%d;%d'));
+});
+
+test('F03 fish bootstrap checks function definition and on-event binding for hook health', () => {
+  const script = makeShellBootstrap('fish', NONCE, '');
+  assert.ok(script.includes('functions -q ' + ID + 'preexec'));
+  assert.ok(script.includes("string match -q -r '^function[[:space:]]+.*--on-event[[:space:]]+fish_preexec' (functions " + ID + 'preexec 2>/dev/null)'));
+  assert.ok(script.includes('END;%d;%d'));
 });

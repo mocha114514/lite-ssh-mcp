@@ -11,6 +11,7 @@ import { TransferManager } from '../src/sftp/manager.js';
 import type { Metadata, WriteHandle } from '../src/sftp/filesystem.js';
 import { TRANSFER_LIMITS } from '../src/sftp/types.js';
 import { createTransferFixture, MappedRemote } from './helpers/sftp.js';
+import { MemorySftpFs } from './helpers/memory-sftp.js';
 
 const base = path.resolve(process.env.LSSH_TEST_ROOT ?? 'vb-test/full-v2', 'sftp-safety', `${process.pid}-${Date.now()}`);
 let serial = 0;
@@ -227,4 +228,279 @@ test('a confirmed mkdir remains recorded when its immediate post-check fails', a
   assert.equal(result.directoriesCreated, 1);
   assert.equal(progress, 1);
   assert.equal((await fs.lstat(path.join(f.remoteRoot, 'new'))).isDirectory(), true);
+});
+
+class HookedMemoryFs extends MemorySftpFs {
+  onLstat?: (value: string, current: Metadata | undefined) => void;
+  onCreateExclusive?: (value: string) => void;
+  beforeCommit?: (temporary: string, final: string, overwrite: boolean) => void;
+
+  override async lstat(value: string): Promise<Metadata | undefined> {
+    const initial = await super.lstat(value);
+    this.onLstat?.(value, initial);
+    const node = this.nodes.get(this.key(value));
+    return node ? { ...node.metadata } : undefined;
+  }
+
+  override async createExclusive(value: string): Promise<WriteHandle> {
+    this.onCreateExclusive?.(value);
+    return super.createExclusive(value);
+  }
+
+  override async commit(temporary: string, final: string, overwrite: boolean): Promise<boolean> {
+    this.beforeCommit?.(temporary, final, overwrite);
+    return super.commit(temporary, final, overwrite);
+  }
+}
+
+test('observed target metadata change during verifyEntry stops transfer with PATH_CHANGED (overwrite)', async () => {
+  const source = new HookedMemoryFs();
+  const target = new HookedMemoryFs();
+  source.directory('/src');
+  source.file('/src/file', 'source-bytes');
+  target.directory('/dst');
+  target.file('/dst/file', 'old-target');
+
+  let armed = false;
+  let afterArm = 0;
+  target.onCreateExclusive = () => { armed = true; };
+  target.onLstat = (val) => {
+    if (target.key(val) !== target.key('/dst/file')) return;
+    if (armed) {
+      afterArm++;
+      // In verifyEntry before commit:
+      // afterArm === 1 is assertGuards (sees old target metadata)
+      // afterArm === 2 is resolvePath (sees mutated metadata)
+      if (afterArm === 2) {
+        const node = target.nodes.get(target.key('/dst/file'))!;
+        node.metadata = {
+          ...node.metadata,
+          size: 99,
+          mtime: 5555,
+          identity: 'id-replaced'
+        };
+        node.content = Buffer.from('MUTATED-CONTENT-SHOULD-NOT-BE-OVERWRITTEN');
+      }
+    }
+  };
+
+  const plan = await planTransfer(
+    source, target, '/src/file', '/dst/file',
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    TRANSFER_LIMITS, signal()
+  );
+  assert.equal(plan.planningComplete, true);
+  assert.equal(plan.issues.length, 0);
+
+  const outcome = await runTransfer(
+    source, target, plan,
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    'audit-observed-target', TRANSFER_LIMITS, signal()
+  );
+
+  assert.equal(outcome.phase, 'failed');
+  assert.equal(outcome.filesCommitted, 0);
+  assert.equal(outcome.error?.code, 'PATH_CHANGED');
+  assert.equal(target.content('/dst/file'), 'MUTATED-CONTENT-SHOULD-NOT-BE-OVERWRITTEN');
+  assert.equal(outcome.cleanup.complete, true);
+  assert.deepEqual(outcome.cleanup.residualPaths, []);
+});
+
+test('unmodified target in overwrite mode completes successfully and commits (control)', async () => {
+  const source = new HookedMemoryFs();
+  const target = new HookedMemoryFs();
+  source.directory('/src');
+  source.file('/src/file', 'source-bytes');
+  target.directory('/dst');
+  target.file('/dst/file', 'old-target');
+
+  const plan = await planTransfer(
+    source, target, '/src/file', '/dst/file',
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    TRANSFER_LIMITS, signal()
+  );
+  assert.equal(plan.planningComplete, true);
+
+  const outcome = await runTransfer(
+    source, target, plan,
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    'audit-target-control', TRANSFER_LIMITS, signal()
+  );
+
+  assert.equal(outcome.phase, 'completed');
+  assert.equal(outcome.filesCommitted, 1);
+  assert.equal(outcome.error, undefined);
+  assert.equal(target.content('/dst/file'), 'source-bytes');
+});
+
+test('observed source metadata change during verifyEntry stops transfer with PATH_CHANGED', async () => {
+  const source = new HookedMemoryFs();
+  const target = new HookedMemoryFs();
+  source.directory('/src');
+  source.file('/src/file', 'source-bytes');
+  target.directory('/dst');
+
+  let armed = false;
+  let afterArm = 0;
+  target.onCreateExclusive = () => { armed = true; };
+  source.onLstat = (val) => {
+    if (source.key(val) !== source.key('/src/file')) return;
+    if (armed) {
+      afterArm++;
+      // In verifyEntry before commit:
+      // afterArm === 1 is assertGuards
+      // afterArm === 2 is resolvePath
+      if (afterArm === 2) {
+        const node = source.nodes.get(source.key('/src/file'))!;
+        node.metadata = {
+          ...node.metadata,
+          size: 88,
+          mtime: 8888,
+          identity: 'source-replaced'
+        };
+      }
+    }
+  };
+
+  const plan = await planTransfer(
+    source, target, '/src/file', '/dst/file',
+    { conflictPolicy: 'overwrite_merge_off', symlinkPolicy: 'symlink_follow_off' },
+    TRANSFER_LIMITS, signal()
+  );
+  assert.equal(plan.planningComplete, true);
+
+  const outcome = await runTransfer(
+    source, target, plan,
+    { conflictPolicy: 'overwrite_merge_off', symlinkPolicy: 'symlink_follow_off' },
+    'audit-observed-source', TRANSFER_LIMITS, signal()
+  );
+
+  assert.equal(outcome.phase, 'failed');
+  assert.equal(outcome.filesCommitted, 0);
+  assert.equal(outcome.error?.code, 'PATH_CHANGED');
+  assert.equal(target.nodes.has(target.key('/dst/file')), false);
+  assert.equal(outcome.cleanup.complete, true);
+});
+
+test('unmodified source completes successfully (control)', async () => {
+  const source = new HookedMemoryFs();
+  const target = new HookedMemoryFs();
+  source.directory('/src');
+  source.file('/src/file', 'source-bytes');
+  target.directory('/dst');
+
+  const plan = await planTransfer(
+    source, target, '/src/file', '/dst/file',
+    { conflictPolicy: 'overwrite_merge_off', symlinkPolicy: 'symlink_follow_off' },
+    TRANSFER_LIMITS, signal()
+  );
+  assert.equal(plan.planningComplete, true);
+
+  const outcome = await runTransfer(
+    source, target, plan,
+    { conflictPolicy: 'overwrite_merge_off', symlinkPolicy: 'symlink_follow_off' },
+    'audit-source-control', TRANSFER_LIMITS, signal()
+  );
+
+  assert.equal(outcome.phase, 'completed');
+  assert.equal(outcome.filesCommitted, 1);
+  assert.equal(target.content('/dst/file'), 'source-bytes');
+});
+
+test('unobserved target change after verify boundary before commit commits without full transaction guarantee', async () => {
+  const source = new HookedMemoryFs();
+  const target = new HookedMemoryFs();
+  source.directory('/src');
+  source.file('/src/file', 'source-bytes');
+  target.directory('/dst');
+  target.file('/dst/file', 'old-target');
+
+  const seenIdentities: string[] = [];
+  target.onLstat = (val, meta) => {
+    if (target.key(val) === target.key('/dst/file') && meta?.identity) {
+      seenIdentities.push(meta.identity);
+    }
+  };
+  target.beforeCommit = (_temp, final, overwrite) => {
+    if (!overwrite) return;
+    const node = target.nodes.get(target.key(final));
+    if (node) {
+      node.metadata = { ...node.metadata, size: 77, mtime: 7777, identity: 'id-after-verify' };
+      node.content = Buffer.from('LATE-RACE-NOT-OBSERVED');
+    }
+  };
+
+  const plan = await planTransfer(
+    source, target, '/src/file', '/dst/file',
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    TRANSFER_LIMITS, signal()
+  );
+  assert.equal(plan.planningComplete, true);
+
+  const outcome = await runTransfer(
+    source, target, plan,
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    'audit-unobserved-window', TRANSFER_LIMITS, signal()
+  );
+
+  assert.equal(seenIdentities.includes('id-after-verify'), false);
+  assert.equal(outcome.phase, 'completed');
+  assert.equal(outcome.filesCommitted, 1);
+  assert.equal(target.content('/dst/file'), 'source-bytes');
+});
+
+test('target directory creation and normal directory mtime changes do not trigger false-alarm PATH_CHANGED', async () => {
+  const source = new HookedMemoryFs();
+  const target = new HookedMemoryFs();
+  source.directory('/src/dir');
+  source.file('/src/dir/file1', 'data-1');
+  source.file('/src/dir/file2', 'data-2');
+  target.directory('/dst');
+
+  const plan = await planTransfer(
+    source, target, '/src/dir', '/dst/dir',
+    { conflictPolicy: 'overwrite_merge_off', symlinkPolicy: 'symlink_follow_off' },
+    TRANSFER_LIMITS, signal()
+  );
+  assert.equal(plan.planningComplete, true);
+  assert.ok(plan.directories.includes('/dst/dir'));
+
+  const outcome = await runTransfer(
+    source, target, plan,
+    { conflictPolicy: 'overwrite_merge_off', symlinkPolicy: 'symlink_follow_off' },
+    'audit-dir-mtime', TRANSFER_LIMITS, signal()
+  );
+
+  assert.equal(outcome.phase, 'completed');
+  assert.equal(outcome.directoriesCreated, 1);
+  assert.equal(outcome.filesCommitted, 2);
+  assert.equal(target.content('/dst/dir/file1'), 'data-1');
+  assert.equal(target.content('/dst/dir/file2'), 'data-2');
+});
+
+test('multiple files update known target guard and allow subsequent entries to verify against committed state', async () => {
+  const source = new HookedMemoryFs();
+  const target = new HookedMemoryFs();
+  source.file('/src/a', 'source-a');
+  source.file('/src/b', 'source-b');
+  target.file('/dst/a', 'old-a');
+  target.file('/dst/b', 'old-b');
+
+  const plan = await planTransfer(
+    source, target, '/src', '/dst',
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    TRANSFER_LIMITS, signal()
+  );
+  assert.equal(plan.planningComplete, true);
+
+  const outcome = await runTransfer(
+    source, target, plan,
+    { conflictPolicy: 'overwrite_merge_on', symlinkPolicy: 'symlink_follow_off' },
+    'audit-update-known', TRANSFER_LIMITS, signal()
+  );
+
+  assert.equal(outcome.phase, 'completed');
+  assert.equal(outcome.filesCommitted, 2);
+  assert.equal(target.content('/dst/a'), 'source-a');
+  assert.equal(target.content('/dst/b'), 'source-b');
 });

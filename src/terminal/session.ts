@@ -52,6 +52,8 @@ interface Cycle {
    * `shell_input_finished` result; an idle candidate has no owner.
    */
   owner?: number;
+  /** Marked when a bare interrupt (Ctrl-C) at the prompt owns this candidate cycle. */
+  interrupt?: boolean;
 }
 
 /** One concrete PTY instance. Waiters keep this object, never look up a reused codename. */
@@ -82,6 +84,12 @@ export class TerminalSession {
   private failure?: LiteSshError;
   /** Receive-side health is separate: remote EOF must not discard accepted bytes. */
   private recordingFailure?: LiteSshError;
+  /**
+   * A command can repair the BEGIN hook before its END reports healthy. Keep
+   * observed hook loss until a valid trusted BEGIN proves boundaries work
+   * again; neither a healthy END nor the absence of an owner proves recovery.
+   */
+  private beginHookTrustLost = false;
   /** The single open cache round/candidate; see {@link Cycle}. */
   private cycle?: Cycle;
   /**
@@ -96,7 +104,7 @@ export class TerminalSession {
   private lastResult?: RoundResult;
   /** Only active tool observers retain owner results: at most 64 per PTY. */
   private readonly waitingOwners = new Set<number>();
-  private readonly ownerResults = new Map<number, { result: RoundResult; sequence: number }>();
+  private readonly ownerResults = new Map<number, { result?: RoundResult; error?: LiteSshError; sequence: number }>();
   private activeWrites = 0;
   /** Cancellation releases observers, not retained work. This credit spans
    * the awaited send AND post-observation parsing/recording drains, until the
@@ -106,6 +114,10 @@ export class TerminalSession {
   private batchOwner?: number;
   /** Once boundaries mix, this PTY keeps factual rounds but never guesses ownership. */
   private ownershipAmbiguous = false;
+  /** Transient provenance barrier caused specifically by prompt interrupt (Ctrl-C). */
+  private interruptBarrier = false;
+  /** Count of submissions entered while interruptBarrier is active. */
+  private interruptSubmissions = 0;
   /** Closed waiters may inspect the final parsed screen after emulator disposal. */
   private finalScreen?: ScreenSnapshot;
   private closePromise?: Promise<Record<string, unknown>>;
@@ -281,7 +293,7 @@ export class TerminalSession {
     } else if (this.initialized && marker.kind === 'begin') {
       this.onTrustedBegin();
     } else if (this.initialized && marker.kind === 'end') {
-      this.onTrustedEnd(marker.exitCode);
+      this.onTrustedEnd(marker.exitCode, marker.hookHealthy);
     }
     this.notify();
   }
@@ -303,6 +315,7 @@ export class TerminalSession {
   private onTrustedBegin(): void {
     const cycle = this.cycle;
     if (!cycle) {
+      this.beginHookTrustLost = false;
       // A shell-side command we did not reserve: still give its output a round.
       const opened: Cycle = { id: this.recorder.beginRound(), published: true, started: true };
       this.cycle = opened;
@@ -313,9 +326,14 @@ export class TerminalSession {
       this.fail(new LiteSshError('SHELL_INTEGRATION_LOST', 'A second BEGIN arrived before the previous round ended.'), 'SHELL_INTEGRATION_LOST');
       return;
     }
-    // A queued owner is claimed only by a real shell boundary, not by the
-    // number of Enter bytes in a prior input packet.
-    this.assignPendingToken();
+    this.beginHookTrustLost = false;
+    cycle.interrupt = undefined;
+    // F04: Only assign queued ownership if ownership is not ambiguous (cancel/expired barrier)
+    // and no interrupt provenance barrier is active.
+    // Factual execution (started, published, markCommandStarted) is ALWAYS recorded!
+    if (!this.ownershipAmbiguous && !this.interruptBarrier) {
+      this.assignPendingToken();
+    }
     cycle.started = true;
     cycle.published = true;
     // Separate the trusted command output from any pre-execution echo already
@@ -340,7 +358,10 @@ export class TerminalSession {
    * After closing, the next PRIVATE candidate is opened immediately so the
    * following prompt/echo output has a readable home before the next handoff.
    */
-  private onTrustedEnd(exitCode: number): void {
+  private onTrustedEnd(exitCode: number, hookHealthy = true): void {
+    // This health fact also matters when no input reserved a cycle. A healthy
+    // END cannot clear earlier loss: the repair command itself may lack BEGIN.
+    if (!hookHealthy) this.beginHookTrustLost = true;
     const observedSeq = this.eventSequence;
     const cycle = this.cycle;
     if (!cycle) {
@@ -350,22 +371,49 @@ export class TerminalSession {
       this.prepareNextCycle();
       return;
     }
-    this.assignPendingToken(); // A genuine END-only cycle can claim a queued owner.
+    const isInterrupt = cycle.interrupt === true;
+    if (!isInterrupt) {
+      this.assignPendingToken(); // A genuine END-only cycle can claim a queued owner.
+    }
     this.cycle = undefined;
-    const completion = this.recorder.endRound(exitCode);
     const started = cycle.started;
+    const isCompromised = !started && this.beginHookTrustLost;
+    const completion = this.recorder.endRound(exitCode, isCompromised ? { commandStartUnknown: true } : undefined);
+    if (started && this.interruptBarrier) {
+      this.interruptBarrier = false;
+      this.interruptSubmissions = 0;
+    }
     this.prepareNextCycle();
     void this.roundWrites.run(async () => {
       const result = await completion;
       if (result.round === cycle.id) {
-        // A trusted END is a factual cycle completion even when this session
-        // did not own the submission. `commandStarted` stays false for a
-        // non-executed END, so this is never an execution claim, and the
-        // writer-owner gate in `write()` still stops any writer from claiming
-        // a completion it did not submit.
-        this.lastResult = { ...result, commandStarted: started };
-        if (cycle.owner !== undefined && this.waitingOwners.has(cycle.owner)) {
-          this.ownerResults.set(cycle.owner, { result: this.lastResult, sequence: observedSeq });
+        if (isCompromised) {
+          // F03: Hook compromised. Do not declare fake commandStarted: false or shell_input_finished.
+          // Retain factual round with commandStartUnknown diagnostic.
+          this.lastResult = result;
+          if (cycle.owner !== undefined && this.waitingOwners.has(cycle.owner)) {
+            const lostError = new LiteSshError(
+              'SHELL_INTEGRATION_LOST',
+              'Shell integration hook was removed or compromised; command execution could not be delimited.',
+              {
+                round: result.round,
+                exitCode: result.exitCode,
+                commandStartUnknown: true,
+                cacheRange: result.cacheRange,
+              },
+            );
+            this.ownerResults.set(cycle.owner, { error: lostError, result, sequence: observedSeq });
+          }
+        } else {
+          // A trusted END is a factual cycle completion even when this session
+          // did not own the submission. `commandStarted` stays false for a
+          // non-executed END, so this is never an execution claim, and the
+          // writer-owner gate in `write()` still stops any writer from claiming
+          // a completion it did not submit.
+          this.lastResult = { ...result, commandStarted: started };
+          if (cycle.owner !== undefined && this.waitingOwners.has(cycle.owner)) {
+            this.ownerResults.set(cycle.owner, { result: this.lastResult, sequence: observedSeq });
+          }
         }
         this.notify();
       }
@@ -375,13 +423,16 @@ export class TerminalSession {
   /** Future input is not a shell cycle until a real BEGIN/END claims it. */
   private prepareNextCycle(): void {
     this.cycle = this.openCycle();
+    if (this.interruptBarrier) {
+      this.cycle.interrupt = true;
+    }
   }
 
   /** Give the open, unstarted, unowned cycle the next queued submission token. */
   private assignPendingToken(): void {
     if (this.ownershipAmbiguous) return; // Expired queued credits cannot migrate to another waiter.
     const cycle = this.cycle;
-    if (!cycle || cycle.started || cycle.owner !== undefined) return;
+    if (!cycle || cycle.started || cycle.owner !== undefined || cycle.interrupt) return;
     const token = this.pendingTokens.shift() ??
       (this.batchOwner !== undefined && this.waitingOwners.has(this.batchOwner) ? this.batchOwner : undefined);
     if (token === undefined) return;
@@ -397,7 +448,7 @@ export class TerminalSession {
    * been handed to the shell yet. Returns this write's submission token (used to
    * attribute a completion to the writer that actually submitted it).
    */
-  private handoff(submissions: number): number | undefined {
+  private handoff(submissions: number, packet = ''): number | undefined {
     if (this.ownershipAmbiguous) return undefined;
     const unresolvedBatch = this.batchOwner;
     this.batchOwner = undefined;
@@ -412,7 +463,7 @@ export class TerminalSession {
       this.pendingTokens = [];
       return undefined;
     }
-    if (this.cycle && !this.cycle.published && this.pendingTokens.length > 0) {
+    if (this.cycle && !this.cycle.published && this.pendingTokens.length > 0 && !this.cycle.interrupt) {
       this.ownershipAmbiguous = true;
       // Earlier overlapping writes might have been continuation fragments, not
       // additional commands. A new packet across this private boundary makes
@@ -421,8 +472,34 @@ export class TerminalSession {
       this.pendingTokens = [];
       return undefined;
     }
+    const hasCtrlC = packet.includes('\x03');
+    if (hasCtrlC) {
+      if (!this.cycle) this.cycle = this.openCycle();
+      if (!this.cycle.started) {
+        this.cycle.interrupt = true;
+        // Another Ctrl-C cannot prove that earlier buffered submissions have
+        // retired. Initialize only when entering a new provenance episode.
+        if (!this.interruptBarrier) this.interruptSubmissions = 0;
+        this.interruptBarrier = true;
+        for (const pending of this.pendingTokens) this.waitingOwners.delete(pending);
+        this.pendingTokens = [];
+      }
+    }
     if (submissions <= 0) return undefined;
     if (this.cycle?.started) return undefined; // Bytes go to the running program's stdin.
+
+    if (this.interruptBarrier) {
+      this.interruptSubmissions += submissions;
+      if (this.interruptSubmissions > 1) {
+        // Multiple submissions entered during the interrupt barrier (either a single
+        // packet with multiple Enters or multiple independent packets during the barrier).
+        // Line discipline now contains multiple pending commands; we cannot guess when the
+        // shell finishes these lines, so escalate to permanent ownershipAmbiguous.
+        this.ownershipAmbiguous = true;
+      }
+      return undefined;
+    }
+
     const token = (this.submissionCounter += 1);
     // Several Enters can belong to one quote/loop/continuation. A write offers
     // one conservative ownership credit; only trusted shell markers create
@@ -533,7 +610,7 @@ export class TerminalSession {
       ok: !this.failure, state: this.status === 'closed' ? 'closed' : this.failure ? 'error' : this.status,
       terminal: { ...this.identity }, cachePath: this.recorder.path,
       currentRound: this.activeRound() ?? null, lastCompletedRound: this.lastResult ?? null,
-      ...(this.ownershipAmbiguous ? { completionOwnership: 'unknown' } : {}),
+      ...(this.ownershipAmbiguous || this.interruptBarrier ? { completionOwnership: 'unknown' } : {}),
       screen: this.finalScreen ?? this.screen.snapshot(),
       ...(this.failure ? { code: this.failure.code, message: this.failure.message, cacheMayBeIncomplete: true } : {})
     };
@@ -633,7 +710,7 @@ export class TerminalSession {
         this.checkInputBudget(packet); // Reject before publishing an unsent round.
         observeScreenChange = this.activeRound() !== undefined || submissions === 0;
         ambiguousBatch = submissions > 1;
-        token = this.handoff(submissions);
+        token = this.handoff(submissions, packet);
         this.recorder.recordStep(actions);
         // Events observed while waiting for the send queue are not post-input observations.
         initialRevision = this.screen.snapshot().revision;
@@ -662,7 +739,22 @@ export class TerminalSession {
       if (this.failure || this.status !== 'open') return { ...this.current(), inputSent: true, inputHandled: 'unknown' };
       const owned = token === undefined ? undefined : this.ownerResults.get(token);
       if (owned && owned.sequence >= baseline) {
-        const result = owned.result;
+        if (owned.error) {
+          return {
+            ...this.current(),
+            ...(owned.result ?? {}),
+            ok: false,
+            state: 'error',
+            code: owned.error.code,
+            message: owned.error.message,
+            terminal: { ...this.identity },
+            cachePath: this.recorder.path,
+            inputSent: true,
+            inputHandled: 'unknown',
+            ...owned.error.details,
+          };
+        }
+        const result = owned.result!;
         return { ok: true, state: result.commandStarted === false ? 'shell_input_finished' : 'command_completed', terminal: { ...this.identity }, cachePath: this.recorder.path, ...result, inputSent: true, inputHandled: 'unknown',
           ...(result.commandStarted === false ? { message: 'The shell finished handling submitted input without starting a foreground command. Consult exitCode and readable diagnostics.' } : {}),
           ...(result.outputOmitted ? { message: 'Output exceeds 1000 Unicode code points. Use local file tools on cachePath within the returned round markers.' } : {}) };
@@ -748,8 +840,17 @@ export class TerminalSession {
       }));
       await attempt(() => this.output.drain());
       await attempt(() => this.roundWrites.drain());
-      try { Object.assign(cleanup, await this.recorder.close()); }
-      catch (error) {
+      try {
+        const recorderResult = await this.recorder.close();
+        Object.assign(cleanup, {
+          cacheRemoved: recorderResult.cacheRemoved,
+          ...(recorderResult.cleanupError !== undefined ? { cleanupError: recorderResult.cleanupError } : {}),
+        });
+        const recErr = this.recorder.failed;
+        if (recErr) {
+          this.failRecording(recErr);
+        }
+      } catch (error) {
         Object.assign(cleanup, terminalCleanupFailure(error));
         failed(error);
       }
@@ -773,28 +874,51 @@ export class TerminalSession {
         ));
       }
       this.status = 'closed';
+      try { this.events.emit('dispose'); }
+      catch (error) { failed(error); }
+      finally { this.events.removeAllListeners(); }
+
+      const recordingErr = this.recordingFailure ?? this.recorder.failed;
+      if (recordingErr && !this.recordingFailure) {
+        this.failRecording(recordingErr);
+      }
+
+      const diagnosticLoss: Record<string, unknown> = {};
+      if (recordingErr) {
+        diagnosticLoss.recordingErrorCode = recordingErr.code;
+        diagnosticLoss.cacheMayBeIncomplete = true;
+        if (typeof recordingErr.details?.reason === 'string') {
+          diagnosticLoss.reason = recordingErr.details.reason;
+        }
+        if (typeof recordingErr.details?.droppedChunks === 'number') {
+          diagnosticLoss.droppedChunks = recordingErr.details.droppedChunks;
+        }
+        if (typeof recordingErr.details?.droppedBytes === 'number') {
+          diagnosticLoss.droppedBytes = recordingErr.details.droppedBytes;
+        }
+      }
+
+      const primaryFailure = recordingErr ?? failure;
       const result: Record<string, unknown> = {
         ...cleanup,
-        ok: !failure && cleanup.cacheRemoved === true && !cleanup.cleanupError,
+        ...diagnosticLoss,
+        ok: !primaryFailure && cleanup.cacheRemoved === true && !cleanup.cleanupError,
         state: remoteChannelCleanupConfirmed ? 'closed' : 'error',
         terminal: { ...this.identity },
         cachePath: this.recorder.path,
         localTerminalClosed: true,
         remoteChannelCleanupConfirmed,
-        remoteBackgroundProcessesTerminated: 'not_guaranteed'
+        remoteBackgroundProcessesTerminated: 'not_guaranteed',
       };
-      this.closeResult = result;
-      try { this.events.emit('dispose'); }
-      catch (error) { failed(error); }
-      finally { this.events.removeAllListeners(); }
-      if (failure) {
+      if (primaryFailure) {
         Object.assign(result, {
           ok: false,
-          code: failure.code,
-          message: failure.message,
-          terminalCleanupErrorCode: failure.code
+          code: primaryFailure.code,
+          message: primaryFailure.message,
+          terminalCleanupErrorCode: primaryFailure.code,
         });
       }
+      this.closeResult = result;
     }
     return this.closeResult!;
   }

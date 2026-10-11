@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { SFTPWrapper } from 'ssh2';
 import { RemoteFileSystem } from '../src/sftp/remote.js';
+import { TRANSFER_LIMITS } from '../src/sftp/types.js';
 
 class Channel extends EventEmitter {
   ended = 0;
@@ -124,6 +125,96 @@ test('handle READDIR EOF is normal exhaustion and still closes the directory han
     assert.equal(reads, 2);
     assert.equal(closes, 1);
   } finally { await fs.dispose(); }
+});
+
+class DirectoryChannel extends EventEmitter {
+  reads = 0;
+  closes = 0;
+  emptyForever = false;
+
+  constructor(private readonly batches: string[][]) {
+    super();
+  }
+
+  opendir(_path: string, callback: (error: undefined, handle: Buffer) => void): void {
+    callback(undefined, Buffer.alloc(4));
+  }
+
+  readdir(_handle: Buffer, callback: (error: Error | undefined, entries?: unknown[]) => void): void {
+    this.reads++;
+    const batch = this.batches.shift();
+    if (batch !== undefined || this.emptyForever) {
+      callback(undefined, (batch ?? []).map(filename => ({ filename })));
+    } else {
+      callback(Object.assign(new Error('normal EOF'), { code: 1 }));
+    }
+  }
+
+  close(_handle: Buffer, callback: (error?: Error) => void): void {
+    this.closes++;
+    callback();
+  }
+
+  end(): void {
+    queueMicrotask(() => this.emit('close'));
+  }
+}
+
+test('empty READDIR NAME batches do not end enumeration before protocol EOF', async () => {
+  const channel = new DirectoryChannel([
+    [],
+    ['.', '..'],
+    [],
+    ['late.txt', '中文.txt'],
+    [],
+    ['last.txt']
+  ]);
+  const fs = new RemoteFileSystem(channel as unknown as SFTPWrapper, 25, 25);
+  try {
+    const names: string[] = [];
+    for await (const name of fs.entries('/synthetic')) {
+      names.push(name);
+    }
+    assert.deepEqual(names, ['late.txt', '中文.txt', 'last.txt']);
+    assert.equal(channel.reads, 7);
+    assert.equal(channel.closes, 1);
+  } finally {
+    await fs.dispose();
+  }
+});
+
+test('unbounded empty READDIR replies fail explicitly instead of fabricating complete enumeration', async () => {
+  const channel = new DirectoryChannel([]);
+  channel.emptyForever = true;
+  const fs = new RemoteFileSystem(channel as unknown as SFTPWrapper, 25, 25);
+  try {
+    await assert.rejects(async () => {
+      for await (const _name of fs.entries('/synthetic')) {
+        assert.fail('The fixture only returns empty NAME replies.');
+      }
+    }, { code: 'RESOURCE_LIMIT' });
+    assert.equal(channel.reads, TRANSFER_LIMITS.entries + 1);
+    assert.equal(channel.closes, 1);
+  } finally {
+    await fs.dispose();
+  }
+});
+
+test('disposing during directory enumeration rejects its pending read without dispatching a new handle close', async () => {
+  const channel = new DirectoryChannel([[]]);
+  channel.readdir = (_handle, _callback): void => {
+    channel.reads++;
+    // Keep READDIR pending until the owning SFTP channel is disposed.
+  };
+  const fs = new RemoteFileSystem(channel as unknown as SFTPWrapper, 25, 25);
+  const iterator = fs.entries('/synthetic')[Symbol.asyncIterator]();
+  const pending = iterator.next();
+  await sleep(0);
+  assert.equal(channel.reads, 1);
+  const observedFailure = assert.rejects(pending, { code: 'CONNECTION_LOST' });
+  assert.equal(await fs.dispose(), true);
+  await observedFailure;
+  assert.equal(channel.closes, 0);
 });
 
 test('callback failure before close preserves uncertain WRITE; numeric STATUS stays distinct', async () => {
