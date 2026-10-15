@@ -138,7 +138,7 @@ test('uncertain wx creation retains a possible residual, never asserts ownership
     assert.deepEqual((done.cleanup as { possibleResidualPaths: string[] }).possibleResidualPaths, [attempted]);
     assert.equal((done.cleanup as { complete: boolean }).complete, false);
     assert.deepEqual(await fs.readdir(f.remoteRoot), [path.posix.basename(attempted)]);
-  } finally { await manager.dispose(); }
+  } finally { await assertIncompleteShutdown(manager, attempted); }
 });
 
 test('cancelled with changed temporary ownership reaches a terminal result, not permanent cancelling', async () => {
@@ -178,7 +178,7 @@ test('cancelled with changed temporary ownership reaches a terminal result, not 
     assert.equal((done.cleanup as { outcomeUnknown: boolean }).outcomeUnknown, true);
     assert.deepEqual((done.cleanup as { possibleResidualPaths: string[] }).possibleResidualPaths, [attempted]);
     assert.equal(await fs.readFile(path.join(f.remoteRoot, path.posix.basename(attempted)), 'utf8'), 'foreign replacement fixture');
-  } finally { await manager.dispose(); }
+  } finally { await assertIncompleteShutdown(manager, attempted); }
 });
 
 test('directory-only plans do not require file-publication extensions', async () => {
@@ -504,3 +504,20 @@ test('multiple files update known target guard and allow subsequent entries to v
   assert.equal(target.content('/dst/a'), 'source-a');
   assert.equal(target.content('/dst/b'), 'source-b');
 });
+
+async function assertIncompleteShutdown(manager: TransferManager, attempted: string): Promise<void> {
+  // F09 now surfaces the same residual facts at shutdown instead of deleting
+  // the registry and resolving successfully. Keep all original data/ownership
+  // assertions above, and explicitly require this new shutdown contract.
+  await assert.rejects(manager.dispose(), error => {
+    assert.ok(error instanceof LiteSshError);
+    assert.equal(error.code, 'TRANSFER_CLEANUP_FAILED');
+    const failures = error.details.cleanupFailures as Array<{
+      facts: { cleanup: { complete: boolean; possibleResidualPaths: string[] } };
+    }>;
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]?.facts.cleanup.complete, false);
+    assert.deepEqual(failures[0]?.facts.cleanup.possibleResidualPaths, [attempted]);
+    return true;
+  });
+}

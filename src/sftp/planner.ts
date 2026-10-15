@@ -12,6 +12,8 @@ export interface PlannedEntry {
   source: Metadata;
   sourceGuardKeys: string[];
   targetGuardKeys: string[];
+  /** Earlier canonical file entry for this exact source/target publication. */
+  sharedCopyIndex?: number;
 }
 export interface TransferPlan {
   planningComplete: boolean;
@@ -63,6 +65,7 @@ export async function planTransfer(
     filesTotal: 0, bytesTotal: 0, retainedBytes: 0
   };
   const targetFiles = new Map<string, PlannedEntry>();
+  const fileCopies = new Map<string, number>();
   const targetKinds = new Map<string, string>();
   const directories = new Set<string>();
   const addIssue = (issue: TransferIssue): void => { budget.retain(issue); plan.issues.push(issue); };
@@ -172,7 +175,7 @@ export async function planTransfer(
       }
       targetKinds.set(key, kind);
       if (kind === 'file') {
-        if (!Number.isSafeInteger(entry.source.size) || entry.source.size < 0 || !Number.isSafeInteger(plan.bytesTotal + entry.source.size)) {
+        if (!Number.isSafeInteger(entry.source.size) || entry.source.size < 0) {
           throw new LiteSshError('RESOURCE_LIMIT', 'The file-size precision budget was exceeded.');
         }
         const fileKeys = [key];
@@ -187,13 +190,26 @@ export async function planTransfer(
           : sourceFs.key(previous.actualSourcePath) === sourceKey);
         if (previous && !sameSource) {
           addIssue({ code: 'PATH_MAPPING_CONFLICT', sourcePath: logicalSource, otherSourcePath: previous.sourcePath, targetPath: logicalTarget, actualPath: target.actualPath });
-        } else { for (const fileKey of fileKeys) targetFiles.set(fileKey, entry); }
-        plan.filesTotal++;
-        plan.bytesTotal += entry.source.size;
+        } else {
+          // Only the same publication name/key is shared. Equal target inode
+          // IDs at different names do not suffice: atomic rename may replace
+          // one hard-link name without updating the other requested name.
+          const shared = fileCopies.get(key);
+          if (shared !== undefined) entry.sharedCopyIndex = shared;
+          else fileCopies.set(key, plan.entries.length);
+          for (const fileKey of fileKeys) targetFiles.set(fileKey, entry);
+        }
+        if (entry.sharedCopyIndex === undefined) {
+          if (!Number.isSafeInteger(plan.bytesTotal + entry.source.size)) {
+            throw new LiteSshError('RESOURCE_LIMIT', 'The file-size precision budget was exceeded.');
+          }
+          plan.filesTotal++;
+          plan.bytesTotal += entry.source.size;
+        }
       }
       // Include missing ordinary ancestors, but never mkdir a file leaf.
       for (const guard of target.guards) {
-        if (!guard.metadata && (guard.path !== target.actualPath || kind === 'directory') && !directories.has(targetFs.key(guard.path))) {
+        if (!guard.metadata && (targetFs.key(guard.path) !== key || kind === 'directory') && !directories.has(targetFs.key(guard.path))) {
           budget.retain(guard.path);
           directories.add(targetFs.key(guard.path));
           plan.directories.push(guard.path);

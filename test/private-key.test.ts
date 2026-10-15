@@ -5,7 +5,7 @@ import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
-import ssh2, { type Client } from 'ssh2';
+import ssh2, { type Client, type ParsedKey } from 'ssh2';
 import type { ConfigStore } from '../src/config/store.js';
 import { LiteSshError } from '../src/core/errors.js';
 import { ensurePrivateDirectory } from '../src/platform/permissions.js';
@@ -16,11 +16,56 @@ import { fixtureRoot } from './helpers/workspace.js';
 const root = fixtureRoot('private-key');
 const run = promisify(execFile);
 let serial = 0;
+
+function generateFixtureKey(): string {
+  const failure = 'Ed25519 test fixture generation or validation failed.';
+  const type = Buffer.from('ssh-ed25519');
+  const lengthOffset = 4 + type.length;
+  const payloadOffset = lengthOffset + 4;
+  for (let attempt = 0; attempt < 32; attempt++) {
+    try {
+      // ssh2 1.17.0 can strip public-key leading zeroes along with DER's
+      // unused-bits octet. Retry ONLY that malformed generated positive fixture,
+      // not arbitrary parser failures or valid-length credentials rejected later.
+      const candidate = ssh2.utils.generateKeyPairSync('ed25519');
+      if (typeof candidate.private !== 'string' || typeof candidate.public !== 'string'
+        || candidate.public.length > 80 || !candidate.public.startsWith('ssh-ed25519 ')) {
+        throw new Error();
+      }
+      const encoded = candidate.public.slice('ssh-ed25519 '.length);
+      const blob = Buffer.from(encoded, 'base64');
+      if (!encoded || blob.toString('base64') !== encoded || blob.length < payloadOffset
+        || blob.readUInt32BE(0) !== type.length || !blob.subarray(4, lengthOffset).equals(type)) {
+        throw new Error();
+      }
+      const publicLength = blob.readUInt32BE(lengthOffset);
+      if (publicLength > 32 || blob.length !== payloadOffset + publicLength) {
+        throw new Error();
+      }
+      const parsed = ssh2.utils.parseKey(candidate.private);
+      if (publicLength < 32 && parsed instanceof Error
+        && parsed.message === 'Malformed OpenSSH private key') {
+        continue;
+      }
+      if (publicLength !== 32 || parsed instanceof Error
+        || parsed.type !== 'ssh-ed25519' || !parsed.isPrivateKey()) {
+        throw new Error();
+      }
+      return candidate.private;
+    } catch {
+      // Do not project generated material or a native/parser error's context.
+      // All other generation, structure and parsing failures are immediate.
+      throw new Error(failure);
+    }
+  }
+  throw new Error('Ed25519 test fixture generation exhausted its 32-attempt budget.');
+}
+
 async function fixture(material?: string) {
   const directory = path.join(root, String(++serial));
   await ensurePrivateDirectory(directory);
   const file = path.join(directory, '生成的 key [only fixture].pem');
-  const key = material ?? ssh2.utils.generateKeyPairSync('ed25519').private;
+  const key = material ?? generateFixtureKey();
   await fs.writeFile(file, key, { mode: 0o600 });
   return { directory, file, key };
 }
@@ -186,11 +231,11 @@ test('invalid key is rejected before connect; same-path key rotation isolates ne
   try {
     await assert.rejects(pool.acquire(target), { code: 'AUTH_FAILED' });
     assert.equal(clients.length, 0);
-    await fs.writeFile(f.file, ssh2.utils.generateKeyPairSync('ed25519').private);
+    await fs.writeFile(f.file, generateFixtureKey());
     const old = await pool.acquire(target);
     const same = await pool.acquire(target);
     assert.equal(old.client, same.client);
-    await fs.writeFile(f.file, ssh2.utils.generateKeyPairSync('ed25519').private);
+    await fs.writeFile(f.file, generateFixtureKey());
     const next = await pool.acquire(target);
     assert.notEqual(next.client, old.client);
     assert.equal(end.mock.callCount(), 0, 'rotation never closes an existing lease');
@@ -266,4 +311,83 @@ test('a substituted acquired FD is rejected before reading bytes and is still cl
   await assert.rejects(readPrivateKey(expected.file), { code: 'AUTH_FAILED' });
   assert.equal(reads, 0);
   assert.equal(closes, 1);
+});
+
+// These decision controls use synthetic public blobs and parser stand-ins. All
+// credential-reader and lease tests above retain the real, unmocked parser.
+function syntheticFixturePublicKey(length: number): string {
+  const type = Buffer.from('ssh-ed25519');
+  const blob = Buffer.alloc(4 + type.length + 4 + length, 0x2a);
+  blob.writeUInt32BE(type.length, 0);
+  type.copy(blob, 4);
+  blob.writeUInt32BE(length, 4 + type.length);
+  return `ssh-ed25519 ${blob.toString('base64')}`;
+}
+
+test('Ed25519 positive fixture retries only the recognized short public key rejection', t => {
+  const short = { public: syntheticFixturePublicKey(31), private: 'synthetic_short_key' };
+  const valid = { public: syntheticFixturePublicKey(32), private: 'synthetic_valid_key' };
+  let attempts = 0;
+  const generate = t.mock.method(ssh2.utils, 'generateKeyPairSync', () => ++attempts === 1 ? short : valid);
+  const parse = t.mock.method(ssh2.utils, 'parseKey', (material: Parameters<typeof ssh2.utils.parseKey>[0]) => {
+    if (material === short.private) return new Error('Malformed OpenSSH private key');
+    return { type: 'ssh-ed25519', isPrivateKey: () => true } as ParsedKey;
+  });
+  assert.equal(generateFixtureKey() === valid.private, true);
+  assert.equal(generate.mock.callCount(), 2);
+  assert.equal(parse.mock.callCount(), 2);
+  assert.equal(generate.mock.calls.every(call => (
+    call.arguments.length === 1 && call.arguments[0] === 'ed25519'
+  )), true);
+});
+
+test('Ed25519 positive fixture exhausts its fixed 32-attempt budget without exposing input', t => {
+  const candidate = { public: syntheticFixturePublicKey(31), private: 'synthetic_short_key' };
+  const generate = t.mock.method(ssh2.utils, 'generateKeyPairSync', () => candidate);
+  const parse = t.mock.method(ssh2.utils, 'parseKey', () => new Error('Malformed OpenSSH private key'));
+  assert.throws(generateFixtureKey, { message: 'Ed25519 test fixture generation exhausted its 32-attempt budget.' });
+  assert.equal(generate.mock.callCount(), 32);
+  assert.equal(parse.mock.callCount(), 32);
+});
+
+test('Ed25519 positive fixture rejects other generator, structure and parser errors immediately', t => {
+  const failure = 'Ed25519 test fixture generation or validation failed.';
+  let candidate = { public: syntheticFixturePublicKey(32), private: 'synthetic_private_marker' };
+  let parsed: ParsedKey | Error = new Error('synthetic_hidden_parser_context');
+  let generationThrows = false;
+  const generate = t.mock.method(ssh2.utils, 'generateKeyPairSync', () => {
+    if (generationThrows) throw new Error('synthetic_hidden_generator_context');
+    return candidate;
+  });
+  t.mock.method(ssh2.utils, 'parseKey', () => parsed);
+  const variants = [
+    { public: syntheticFixturePublicKey(32), parsed, generationThrows: false },
+    {
+      public: syntheticFixturePublicKey(32),
+      parsed: new Error('Malformed OpenSSH private key'),
+      generationThrows: false
+    },
+    { public: syntheticFixturePublicKey(31), parsed, generationThrows: false },
+    { public: 'ssh-ed25519 invalid-base64!', parsed, generationThrows: false },
+    { public: syntheticFixturePublicKey(33), parsed, generationThrows: false },
+    {
+      public: syntheticFixturePublicKey(32),
+      parsed: { type: 'ssh-rsa', isPrivateKey: () => true } as ParsedKey,
+      generationThrows: false
+    },
+    {
+      public: syntheticFixturePublicKey(32),
+      parsed: { type: 'ssh-ed25519', isPrivateKey: () => false } as ParsedKey,
+      generationThrows: false
+    },
+    { public: syntheticFixturePublicKey(32), parsed, generationThrows: true }
+  ];
+  for (const variant of variants) {
+    candidate = { public: variant.public, private: 'synthetic_private_marker' };
+    parsed = variant.parsed;
+    generationThrows = variant.generationThrows;
+    const before = generate.mock.callCount();
+    assert.throws(generateFixtureKey, { message: failure });
+    assert.equal(generate.mock.callCount(), before + 1);
+  }
 });

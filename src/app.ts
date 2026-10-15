@@ -1,3 +1,4 @@
+import { CleanupFailures } from './core/cleanup.js';
 import { ConfigStore } from './config/store.js';
 import { ConnectionPool } from './ssh/pool.js';
 import { TerminalService, type TerminalServiceOptions } from './terminal/service.js';
@@ -20,11 +21,17 @@ export function createApplication(options: TerminalServiceOptions & { configPath
     closing ??= (async () => {
       // Terminals and transfers release independent leases before the shared
       // connection pool is ended. Terminal close never owns transfer teardown.
-      await Promise.allSettled([terminals.dispose(false), transfers.dispose()]);
-      // Still detach the MCP transport if physical connection cleanup reports
-      // uncertainty. Leaving stdio attached would otherwise block shutdown.
-      try { await pool.dispose(); }
-      finally { await server.close(); }
+      const cleanup = new CleanupFailures();
+      await Promise.all([
+        cleanup.attempt('terminal', () => terminals.dispose(false), 'TERMINAL_CLEANUP_FAILED'),
+        cleanup.attempt('transfer', () => transfers.dispose(), 'TRANSFER_CLEANUP_FAILED')
+      ]);
+      // Every remaining finalizer is attempted, even after an earlier error.
+      // Ending the pool also resolves pending physical-close ownership tickets;
+      // detaching stdio must never be skipped or replace the earlier failure.
+      await cleanup.attempt('connection', () => pool.dispose(), 'CONNECTION_CLEANUP_FAILED');
+      await cleanup.attempt('mcp', () => server.close(), 'MCP_CLOSE_FAILED');
+      cleanup.throwIfAny();
     })();
     return closing;
   } };

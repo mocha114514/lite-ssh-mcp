@@ -41,7 +41,14 @@ test('failed initialization sends do not leave unhandled marker rejections', { t
   // node:test itself treats any leaked unhandled rejection as a failing test.
 });
 
-test('a late PTY callback is closed while a different shared-connection terminal stays alive', { timeout: 10_000 }, async () => {
+// Windows fixture setup/cleanup includes native permission-helper startup.
+// This outer harness budget does not change the 180ms PTY deadline, the 450ms
+// late callback, or any channel/ownership assertion inside the test.
+const latePtyFixtureTimeoutMs = process.platform === 'win32' ? 30_000 : 10_000;
+
+test('a late PTY callback is closed while a different shared-connection terminal stays alive', {
+  timeout: latePtyFixtureTimeoutMs,
+}, async () => {
   const ssh = await startMockSsh({ lateSecondShellMs: 450 });
   const root = fixtureRoot('session-late', `${process.pid}-${Date.now()}`);
   await fs.mkdir(root, { recursive: true, mode: 0o700 });

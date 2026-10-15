@@ -1,9 +1,10 @@
 import { normalizeIp, validateTerminalTarget } from '../core/targets.js';
 import { LiteSshError } from '../core/errors.js';
+import { CleanupFailures } from '../core/cleanup.js';
 import type { InputAction, LoginTarget, PageOptions, TerminalIdentity, TerminalTarget } from '../core/types.js';
 import { ConnectionPool } from '../ssh/pool.js';
 import { TerminalSession, type SessionOptions } from './session.js';
-import { connectionCleanupFailure, terminalCleanupFailure, withTerminalCleanup } from './cleanup.js';
+import { connectionCleanupFailure, terminalCleanupFailure, terminalShutdownFacts, withTerminalCleanup } from './cleanup.js';
 
 interface Entry { identity: TerminalIdentity; session?: TerminalSession }
 export interface TerminalServiceOptions extends SessionOptions { maxTerminals?: number }
@@ -13,6 +14,7 @@ export class TerminalService {
   private readonly entries = new Map<string, Entry>();
   private readonly opening = new Set<Promise<unknown>>();
   private stopping = false;
+  private retainedCloseCalls = 0;
   constructor(private readonly pool: ConnectionPool, private readonly options: TerminalServiceOptions = {}) {}
 
   async open(login: LoginTarget, codename: string): Promise<Record<string, unknown>> {
@@ -83,16 +85,52 @@ export class TerminalService {
   resize(target: TerminalTarget, cols: number, rows: number): Promise<Record<string, unknown>> { return this.bind(target).resize(cols, rows); }
   async close(target: TerminalTarget): Promise<Record<string, unknown>> {
     const session = this.bind(target);
+    // Public observers can join one owner future indefinitely. Reserve before
+    // the first await; SDK cancellation does not retire the actual close work.
+    // Internal dispose/failed-open finalizers call Session.close directly.
+    if (this.retainedCloseCalls >= 64) {
+      throw new LiteSshError('RESOURCE_LIMIT', 'Too many terminal-close calls are awaiting completion.');
+    }
+    this.retainedCloseCalls++;
     try { return await session.close(); }
     finally {
       if (this.entries.get(target.codename)?.session === session) this.entries.delete(target.codename);
+      this.retainedCloseCalls--;
     }
   }
   async dispose(closePool = true): Promise<void> {
     this.stopping = true;
-    await Promise.allSettled([...this.opening]);
-    await Promise.allSettled([...this.entries.values()].map(entry => entry.session?.close()));
+    const cleanup = new CleanupFailures();
+    const openings = await Promise.allSettled([...this.opening]);
+    for (const opening of openings) {
+      if (opening.status !== 'rejected' || !(opening.reason instanceof LiteSshError)) continue;
+      const details = opening.reason.details;
+      // An ordinary failed open is already reported to its caller. Only its
+      // actual cleanup/loss facts make it a shutdown failure as well.
+      if (details.cacheRemoved === false || details.cacheCleanupUnknown === true ||
+          details.remoteChannelCleanupConfirmed === false ||
+          details.connectionCleanupConfirmed === false || details.cacheMayBeIncomplete === true) {
+        cleanup.add('terminal', opening.reason, 'TERMINAL_CLEANUP_FAILED', terminalShutdownFacts(details));
+      }
+    }
+    const owners = [...this.entries.values()].filter(entry => entry.session !== undefined);
+    const results = await Promise.allSettled(owners.map(async entry => entry.session!.close()));
+    for (let index = 0; index < results.length; index++) {
+      const result = results[index]!;
+      const owner = owners[index]!;
+      if (result.status === 'rejected') {
+        const details = result.reason instanceof LiteSshError ? result.reason.details : {};
+        cleanup.add('terminal', result.reason, 'TERMINAL_CLEANUP_FAILED', terminalShutdownFacts(details, owner.identity));
+      } else if (result.value.ok !== true) {
+        const code = typeof result.value.code === 'string' ? result.value.code : 'TERMINAL_CLEANUP_FAILED';
+        cleanup.add('terminal', new LiteSshError(code, 'An owned terminal reported incomplete cleanup or recording loss.'),
+          'TERMINAL_CLEANUP_FAILED', terminalShutdownFacts(result.value, owner.identity));
+      }
+    }
     this.entries.clear();
-    if (closePool) await this.pool.dispose();
+    if (closePool) {
+      await cleanup.attempt('connection', () => this.pool.dispose(), 'CONNECTION_CLEANUP_FAILED');
+    }
+    cleanup.throwIfAny();
   }
 }

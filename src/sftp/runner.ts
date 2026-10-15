@@ -9,6 +9,8 @@ export interface EntryResult {
   state: 'planned' | 'merged' | 'directory_created' | 'copying' | 'committed' | 'failed';
   bytesTransferred: number;
   errorCode?: string;
+  /** This logical mapping reuses a verified commit, not a second physical copy. */
+  sharedCommitTargetPath?: string;
 }
 export interface TransferProgress {
   filesCommitted: number;
@@ -53,6 +55,24 @@ export async function runTransfer(
     bytesTransferred: 0, bytesCommitted: 0,
     results: new Map(), cleanup: { complete: true, residualPaths: [], possibleResidualPaths: [], outcomeUnknown: false }
   };
+  const copyGroups = new Map<PlannedEntry, PlannedEntry[]>();
+  for (let index = 0; index < plan.entries.length; index++) {
+    const entry = plan.entries[index]!;
+    if (entry.kind !== 'file') continue;
+    const copyIndex = entry.sharedCopyIndex ?? index;
+    const representative = plan.entries[copyIndex];
+    const sameSource = representative && (representative.source.identity && entry.source.identity
+      ? representative.source.identity === entry.source.identity
+      : sourceFs.key(representative.actualSourcePath) === sourceFs.key(entry.actualSourcePath));
+    if (copyIndex > index || representative?.kind !== 'file' ||
+        representative.sharedCopyIndex !== undefined || !sameSource ||
+        targetFs.key(representative.actualTargetPath) !== targetFs.key(entry.actualTargetPath)) {
+      throw new LiteSshError('PLAN_BLOCKED', 'An invalid shared-copy mapping cannot be executed.');
+    }
+    let group = copyGroups.get(representative);
+    if (!group) { group = []; copyGroups.set(representative, group); }
+    group.push(entry);
+  }
   const buffer = Buffer.alloc(limits.chunkBytes);
   const report = (): void => onProgress({
     filesCommitted: outcome.filesCommitted, directoriesCreated: outcome.directoriesCreated,
@@ -72,6 +92,12 @@ export async function runTransfer(
     // must be reconciled with expected guards and halt execution immediately.
     assertObservedGuards(sourceFs, source.guards, plan.sourceGuards, true);
     assertObservedGuards(targetFs, target.guards, plan.targetGuards, false);
+  };
+  const verifyCopy = async (entry: PlannedEntry): Promise<void> => {
+    // Sharing physical I/O must never discard another logical mapping's link
+    // or path observations. Revalidate every member before temp creation and
+    // again immediately before the common publication (including F07 checks).
+    for (const member of copyGroups.get(entry) ?? [entry]) await verifyEntry(member);
   };
   const cleanupTemporary = async (entry: PlannedEntry, temporary: string, expected?: Metadata): Promise<void> => {
     try {
@@ -131,9 +157,21 @@ export async function runTransfer(
     }
     for (const entry of plan.entries) {
       checkCancelled(signal);
-      await verifyEntry(entry);
+      await verifyCopy(entry);
       if (entry.kind === 'directory') {
         outcome.results.set(entry, { state: plan.directories.includes(entry.actualTargetPath) ? 'directory_created' : 'merged', bytesTransferred: 0 });
+        report();
+        continue;
+      }
+      if (entry.sharedCopyIndex !== undefined) {
+        const representative = plan.entries[entry.sharedCopyIndex]!;
+        if (outcome.results.get(representative)?.state !== 'committed') {
+          throw new LiteSshError('PLAN_BLOCKED', 'The shared physical publication has not completed.');
+        }
+        outcome.results.set(entry, {
+          state: 'merged', bytesTransferred: 0,
+          sharedCommitTargetPath: representative.actualTargetPath
+        });
         report();
         continue;
       }
@@ -156,7 +194,7 @@ export async function runTransfer(
         if (!sameMetadata(entry.source, await input.stat())) {
           throw new LiteSshError('PATH_CHANGED', 'The opened source file does not match its planned identity.');
         }
-        await verifyEntry(entry);
+        await verifyCopy(entry);
         checkCancelled(signal);
         output = await targetFs.createExclusive(temporary);
         acquired = true;
@@ -187,7 +225,7 @@ export async function runTransfer(
         output = undefined;
         await input.close();
         input = undefined;
-        await verifyEntry(entry);
+        await verifyCopy(entry);
         await assertGuards(targetFs, [{ path: temporary, metadata: temporaryMetadata }], false, signal);
         checkCancelled(signal);
         // off uses hard-link create-only; on uses reliable replacement. Never
@@ -195,6 +233,17 @@ export async function runTransfer(
         remains = await targetFs.commit(temporary, entry.actualTargetPath, policies.conflictPolicy === 'overwrite_merge_on');
         published = true;
         result.state = 'committed';
+        // One acknowledged publication fulfills every logical mapping in this
+        // group. Record them before exposing progress or doing a fallible
+        // post-check: later cancellation/failure cannot erase committed facts.
+        // Later member iterations still revalidate their guards above.
+        for (const member of copyGroups.get(entry) ?? []) {
+          if (member === entry) continue;
+          outcome.results.set(member, {
+            state: 'merged', bytesTransferred: 0,
+            sharedCommitTargetPath: entry.actualTargetPath
+          });
+        }
         outcome.filesCommitted++;
         outcome.bytesCommitted += position;
         report();

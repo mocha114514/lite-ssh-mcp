@@ -110,6 +110,10 @@ export class TerminalSession {
    * the awaited send AND post-observation parsing/recording drains, until the
    * whole write actually settles; neither phase may retain unbounded calls. */
   private retainedWrites = 0;
+  /** A cancelled MCP observer cannot retire a read still draining or flushing. */
+  private retainedReads = 0;
+  /** Queued resizes share the retained-input-work budget with writes. */
+  private retainedResizes = 0;
   /** Batch origin survives observer expiry; expiry is not an all-input ACK. */
   private batchOwner?: number;
   /** Once boundaries mix, this PTY keeps factual rounds but never guesses ownership. */
@@ -616,17 +620,27 @@ export class TerminalSession {
     };
   }
   async read(): Promise<Record<string, unknown>> {
-    await this.output.drain();
-    await this.roundWrites.drain();
-    await this.recorder.flush();
-    return this.current();
+    if (this.retainedReads >= 64) {
+      throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 retained-read-work budget.');
+    }
+    this.retainedReads++;
+    try {
+      await this.output.drain();
+      await this.roundWrites.drain();
+      await this.recorder.flush();
+      return this.current();
+    } finally {
+      this.retainedReads--;
+    }
   }
 
   async write(actions: InputAction[], signal?: AbortSignal): Promise<Record<string, unknown>> {
     if (signal?.aborted) throw new LiteSshError('REQUEST_CANCELLED', 'Observation cancelled before input handoff.', { inputSent: false });
     if (!actions.length || actions.length > 64) throw new LiteSshError('INVALID_ACTIONS', 'Provide 1 through 64 input actions.');
     if (this.activeWrites >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 active-input-observer budget.');
-    if (this.retainedWrites >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 retained-input-work budget.');
+    if (this.retainedWrites + this.retainedResizes >= 64) {
+      throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 retained-input-work budget.');
+    }
     // Set inside the send transaction, before `sent` flips; the initial value is
     // never observed because the listener ignores events until `sent` is true.
     let observeScreenChange = true;
@@ -782,15 +796,25 @@ export class TerminalSession {
   }
 
   async resize(cols: number, rows: number): Promise<Record<string, unknown>> {
-    return this.sends.run(async () => {
-      if (this.status !== 'open' || !this.channel) throw new LiteSshError('TERMINAL_CLOSED', 'The terminal is not open.');
-      this.channel.setWindow(rows, cols, 0, 0);
-      const screen = this.screen.resize(cols, rows);
-      this.recorder.recordFrame(screen, 'RESIZE');
-      await this.recorder.flush();
-      this.notify();
-      return this.current();
-    });
+    if (this.retainedWrites + this.retainedResizes >= 64) {
+      throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 retained-input-work budget.');
+    }
+    this.retainedResizes++;
+    try {
+      // Await the queued work itself: returning its promise would release this
+      // credit in finally before the window change and cache flush settle.
+      return await this.sends.run(async () => {
+        if (this.status !== 'open' || !this.channel) throw new LiteSshError('TERMINAL_CLOSED', 'The terminal is not open.');
+        this.channel.setWindow(rows, cols, 0, 0);
+        const screen = this.screen.resize(cols, rows);
+        this.recorder.recordFrame(screen, 'RESIZE');
+        await this.recorder.flush();
+        this.notify();
+        return this.current();
+      });
+    } finally {
+      this.retainedResizes--;
+    }
   }
 
   close(): Promise<Record<string, unknown>> {

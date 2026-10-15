@@ -11,7 +11,7 @@ import { parseJsonStrict, type JsonObject, type JsonValue } from './json.js';
 import { buildConfigurationView, type ConfigurationView, type LoginEntry } from './schema.js';
 import { ensurePrivateDirectory, requirePrivatePath, unlinkOwnedFile, type PrivateObjectIdentity } from '../platform/permissions.js';
 import { readConfigurationText } from './file.js';
-import { MAX_CONFIG_BYTES } from './limits.js';
+import { MAX_CONFIG_BYTES, MAX_HOST_KEY_CONFIRMATIONS } from './limits.js';
 
 const LOCK_DEADLINE_MS = 5_000;
 const LOCK_RETRY_MS = 50;
@@ -48,6 +48,7 @@ function revisionOf(entry: LoginEntry): string {
  */
 export class ConfigStore {
   readonly filePath: string;
+  private retainedConfirmations = 0;
 
   constructor(filePath: string = defaultConfigPath()) {
     this.filePath = filePath;
@@ -98,6 +99,27 @@ export class ConfigStore {
       throw new LiteSshError('CONFIG_INVALID', 'The fingerprint must use the SHA256 standard base64 form.');
     }
 
+    // Readers and native permission helpers have later admission points. Hold
+    // this independent work credit before even the first directory/lock await.
+    if (this.retainedConfirmations >= MAX_HOST_KEY_CONFIRMATIONS) {
+      throw new LiteSshError('RESOURCE_LIMIT', 'Too many host-key confirmations are awaiting completion.');
+    }
+    this.retainedConfirmations++;
+    try {
+      // Await the business finalizers: returning its promise directly would
+      // retire this credit early. SDK observation cancellation is not retirement.
+      return await this.performConfirmation({ ip, port }, fingerprint, guard);
+    } finally {
+      this.retainedConfirmations--;
+    }
+  }
+
+  private async performConfirmation(
+    endpoint: Endpoint,
+    fingerprint: string,
+    guard?: HostKeyConfirmationGuard
+  ): Promise<{ changed: boolean; fingerprint: string }> {
+    const { ip, port } = endpoint;
     const release = await this.acquireLock();
     let confirmationCompleted = false;
     let configurationChanged = false;

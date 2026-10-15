@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { BoundedStdioTransport } from './mcp/stdio.js';
 import { createApplication } from './app.js';
 import { ensureConfigurationFiles } from './config/bootstrap.js';
 import { LiteSshError } from './core/errors.js';
@@ -22,10 +22,21 @@ if (process.argv.includes('--version')) {
   process.exitCode = 2;
 } else {
   const app = createApplication();
+  let transport: BoundedStdioTransport | undefined;
+  let diagnosticWritten = false;
+  const report = (message: string): void => {
+    if (diagnosticWritten) return;
+    diagnosticWritten = true;
+    process.stderr.write(message);
+  };
   let stopping = false;
   const stop = (): void => {
+    if (stopping) return;
     stopping = true; // Latch synchronously even while first-run filesystem work is pending.
-    void app.close().catch(() => { process.stderr.write('Shutdown cleanup failed.\n'); process.exitCode = 1; });
+    // Start the absolute IO deadline now, not after domain owners finish. The
+    // application still attempts every existing finalizer without a forced exit.
+    transport?.beginClose();
+    void app.close().catch(() => { report('Shutdown cleanup failed.\n'); process.exitCode = 1; });
   };
   process.stdin.once('end', stop);
   process.once('SIGINT', stop);
@@ -35,13 +46,21 @@ if (process.argv.includes('--version')) {
     await ensureConfigurationFiles(app.store.filePath);
     // close() before connection has no transport to close; never attach a new
     // transport to an application whose idempotent shutdown already began.
-    if (!stopping) await app.server.connect(new StdioServerTransport());
+    if (!stopping) {
+      transport = new BoundedStdioTransport({ onFatal: () => {
+        report('MCP stdio transport failed.\n');
+        process.exitCode = 1;
+        stop();
+      } });
+      await app.server.connect(transport);
+    }
   } catch (error) {
     const message = error instanceof LiteSshError && error.code === 'CONFIG_INIT_FAILED'
       ? `${error.code}: ${error.message}`
       : 'MCP stdio startup failed.';
-    process.stderr.write(`${message}\n`);
-    await app.close();
-    process.exitCode = 1;
+    if (!stopping) report(`${message}\n`);
+    transport?.beginClose();
+    await app.close().catch(() => { process.exitCode = 1; });
+    if (!stopping) process.exitCode = 1;
   }
 }

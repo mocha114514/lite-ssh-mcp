@@ -9,6 +9,7 @@ import { ClientOwner } from '../src/ssh/clientOwner.js';
 import { ConnectionPool } from '../src/ssh/pool.js';
 import { createApplication } from '../src/app.js';
 import { LiteSshError } from '../src/core/errors.js';
+import { CleanupError } from '../src/core/cleanup.js';
 import { fixtureRoot } from './helpers/workspace.js';
 
 class SyntheticClient extends EventEmitter {
@@ -133,7 +134,22 @@ test('application always detaches its MCP transport when pool cleanup reports un
   const failure = new LiteSshError('CONNECTION_CLEANUP_FAILED', 'synthetic unconfirmed close');
   t.mock.method(app.pool, 'dispose', async () => { throw failure; });
   const close = t.mock.method(app.server, 'close');
-  await assert.rejects(app.close(), error => error === failure);
+  // F09 reports a branded aggregate, not the original object's identity.
+  // The primary classification and every concrete cleanup fact must survive.
+  await assert.rejects(app.close(), error => {
+    assert.ok(error instanceof CleanupError);
+    assert.equal(error.code, failure.code);
+    assert.equal(error.message, failure.message);
+    assert.equal(error.failureCount, 1);
+    assert.deepEqual(error.failures, [{
+      resource: 'connection',
+      code: 'CONNECTION_CLEANUP_FAILED'
+    }]);
+    assert.equal(error.details.cleanupFailureCount, 1);
+    assert.equal(error.details.cleanupFailuresComplete, true);
+    assert.deepEqual(error.details.cleanupFailures, error.failures);
+    return true;
+  });
   assert.equal(close.mock.callCount(), 1);
 });
 

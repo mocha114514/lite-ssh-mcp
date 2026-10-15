@@ -43,3 +43,26 @@ export function withTerminalCleanup(
     terminal: { ...identity }
   });
 }
+
+/** Shutdown aggregates only the known public scalar facts from a close result. */
+export function terminalShutdownFacts(
+  result: Record<string, unknown>,
+  identity?: TerminalIdentity
+): Record<string, unknown> {
+  const facts: Record<string, unknown> = identity ? { terminal: { ...identity } } : {};
+  const fields = [
+    'cachePath', 'cacheRemoved', 'cleanupError', 'cacheCleanupUnknown',
+    'localTerminalClosed', 'remoteChannelCleanupConfirmed',
+    'connectionCleanupConfirmed', 'connectionCleanupErrorCode',
+    'recordingErrorCode', 'cacheMayBeIncomplete', 'reason',
+    'droppedChunks', 'droppedBytes', 'terminalCleanupErrorCode'
+  ];
+  for (const field of fields) {
+    const value = result[field];
+    if (typeof value === 'string' || typeof value === 'boolean' ||
+        (typeof value === 'number' && Number.isFinite(value))) {
+      facts[field] = value;
+    }
+  }
+  return facts;
+}

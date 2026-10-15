@@ -56,8 +56,8 @@ test('probe rejects unsafe nonces', () => {
 
 test('bash prepends BEGIN to the existing PS0 instead of replacing it', () => {
   const script = makeShellBootstrap('bash', NONCE, '');
-  // The old PS0 text must survive: our escape is concatenated with "$PS0".
-  assert.ok(script.includes("PS0=$'\\033]777;LSSH;" + NONCE + ";BEGIN\\007'\"$PS0\""));
+  // Existing PS0 text survives, and an unset variable is safe under nounset.
+  assert.ok(script.includes("PS0=$'\\033]777;LSSH;" + NONCE + ";BEGIN\\007'\"${PS0-}\""));
 });
 
 test('bash keeps its PROMPT_COMMAND shape and leaves the DEBUG trap alone', () => {

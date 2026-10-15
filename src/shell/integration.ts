@@ -109,7 +109,7 @@ export function detectShell(probe: string): ShellKind {
 function bashBootstrap(nonce: string, savedStty: string): string {
   const id = '__lssh_' + identifier(nonce) + '_';
   // Concatenate our BEGIN escape with the user's PS0 so their prompt text stays.
-  const begin = "PS0=$'" + oscFormat(nonce, 'BEGIN') + "'\"$PS0\"";
+  const begin = "PS0=$'" + oscFormat(nonce, 'BEGIN') + "'\"${PS0-}\"";
   // $? is captured on the first line, before our printf can clobber it.
   const precmd =
     id + 'precmd() { local ' + id + 'ec=$?; ' +
@@ -126,7 +126,7 @@ function bashBootstrap(nonce: string, savedStty: string): string {
     id + 'ready=0',
     'case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in ' +
       'declare\\ -a*) ' + id + 'pc_array=1; ' + id + 'pc_old=("${PROMPT_COMMAND[@]}");; ' +
-      '*) ' + id + 'pc_array=0; ' + id + 'pc_old="$PROMPT_COMMAND";; esac',
+      '*) ' + id + 'pc_array=0; ' + id + 'pc_old="${PROMPT_COMMAND-}";; esac',
     precmd,
     begin,
     'if [ "$' + id + 'pc_array" = "1" ]; then PROMPT_COMMAND=(' + id +

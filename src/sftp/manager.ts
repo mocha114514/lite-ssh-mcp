@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { LiteSshError } from '../core/errors.js';
+import { CleanupError, CleanupFailures } from '../core/cleanup.js';
 import { loginKey, normalizeIp } from '../core/targets.js';
 import type { ConnectionLease, PageOptions } from '../core/types.js';
 import type { ConnectionPool } from '../ssh/pool.js';
@@ -113,6 +114,7 @@ export class TransferManager {
     let lease: ConnectionLease | undefined;
     let remote: OwnedRemoteFileSystem | undefined;
     let registered = false;
+    let primary: { error: unknown } | undefined;
     let pendingCleanup: Promise<{ confirmed: boolean }> | undefined;
     let releasedAdmission = false;
     const releaseFailedAdmission = (): void => {
@@ -146,25 +148,34 @@ export class TransferManager {
       registered = true;
       this.schedule();
       return { ok: true, accepted: true, ...this.summary(task) };
+    } catch (error) {
+      primary = { error };
+      throw error;
     } finally {
       if (!registered) {
-        try { if (remote) await remote.dispose(); }
-        finally {
-          try { if (lease) await lease.release(); }
-          finally {
-            if (pendingCleanup) {
-              void pendingCleanup.then(result => {
-                if (result?.confirmed === true) {
-                  releaseFailedAdmission();
-                }
-              }).catch(() => {
-                // Unknown reject does not release budget
-              });
-            } else {
-              releaseFailedAdmission();
+        const cleanup = new CleanupFailures();
+        if (remote) {
+          await cleanup.attempt('sftp', async () => {
+            if (await remote!.dispose() !== true) {
+              throw new LiteSshError('SFTP_CLEANUP_FAILED', 'The owned SFTP channel has not confirmed closure.');
             }
-          }
+          }, 'SFTP_CLEANUP_FAILED');
         }
+        if (lease) {
+          await cleanup.attempt('connection', () => lease!.release(), 'CONNECTION_CLEANUP_FAILED');
+        }
+        if (pendingCleanup) {
+          // Waiting here could deadlock shutdown: this physical-close ticket
+          // may require the application's later shared pool.dispose().
+          void pendingCleanup.then(result => {
+            if (result?.confirmed === true) releaseFailedAdmission();
+          }).catch(() => {
+            // Rejection/unknown is not physical-close confirmation.
+          });
+        } else {
+          releaseFailedAdmission();
+        }
+        cleanup.throwIfAny(primary);
       }
     }
   }
@@ -389,16 +400,48 @@ export class TransferManager {
     if (this.pumpTimer) clearImmediate(this.pumpTimer);
     if (this.expiryTimer) clearTimeout(this.expiryTimer);
     this.closing ??= (async () => {
-      await Promise.allSettled([...this.admitting]);
-      for (const task of this.tasks.values()) {
+      const cleanup = new CleanupFailures();
+      const admissions = await Promise.allSettled([...this.admitting]);
+      for (const admission of admissions) {
+        // Operation failures alone are not shutdown failures. The branded
+        // aggregate contains actual failed admission finalizers from F12.
+        if (admission.status === 'rejected' && admission.reason instanceof CleanupError) {
+          cleanup.add('sftp', admission.reason, 'SFTP_CLEANUP_FAILED');
+        }
+      }
+      const tasks = [...this.tasks.values()];
+      for (const task of tasks) {
         if (!isTerminalPhase(task.phase) && !task.finishing) this.cancel(task.transferId);
       }
-      await Promise.all([...this.tasks.values()].map(task => task.completion));
-      for (const task of this.tasks.values()) {
+      const completions = await Promise.allSettled(tasks.map(task => task.completion));
+      for (let index = 0; index < tasks.length; index++) {
+        const task = tasks[index]!;
+        const completion = completions[index]!;
+        if (completion.status === 'rejected') {
+          cleanup.add('transfer', completion.reason, 'TRANSFER_CLEANUP_FAILED', { transferId: task.transferId });
+        }
+        if (!task.cleanup.complete) {
+          cleanup.add('transfer', new LiteSshError('TRANSFER_CLEANUP_FAILED', 'An owned transfer retained incomplete cleanup.'),
+            'TRANSFER_CLEANUP_FAILED', {
+              transferId: task.transferId,
+              channelClosed: task.channelClosed === true,
+              cleanup: {
+                ...task.cleanup,
+                residualPaths: task.cleanup.residualPaths.slice(0, 8),
+                possibleResidualPaths: task.cleanup.possibleResidualPaths.slice(0, 8),
+                residualPathsTotal: task.cleanup.residualPaths.length,
+                possibleResidualPathsTotal: task.cleanup.possibleResidualPaths.length,
+                pathsComplete: task.cleanup.residualPaths.length <= 8 && task.cleanup.possibleResidualPaths.length <= 8
+              }
+            });
+        }
         this.memoryUsed -= task.accountedBytes;
       }
       this.tasks.clear();
       this.expired.clear();
+      // Do not await failed-open physical-close tickets here. They may still
+      // depend on the application's subsequent shared pool.dispose().
+      cleanup.throwIfAny();
     })();
     return this.closing;
   }

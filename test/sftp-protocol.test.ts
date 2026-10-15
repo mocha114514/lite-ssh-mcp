@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createApplication } from '../src/app.js';
+import { CleanupError } from '../src/core/cleanup.js';
 import { startMockSsh } from './helpers/mock-ssh.js';
 import { fixtureRoot } from './helpers/workspace.js';
 import type { MockSftpOptions } from './helpers/mock-sftp.js';
@@ -304,7 +305,7 @@ test('real protocol: lost WRITE outcome is not replayed or disguised as completi
     assert.equal(f.ssh.sftpStats.exclusiveCreates, 1);
     assert.equal(f.ssh.sftpStats.commits, 0);
     assert.equal(f.ssh.authenticatedConnections, 1);
-  } finally { await f.close(); }
+  } finally { await assertIncompleteFixtureClose(f); }
 });
 
 test('real protocol: shutdown closes admission first and awaits its owned channel and handles', { timeout: 20000 }, async () => {
@@ -342,7 +343,7 @@ test('real protocol: callback-lost exclusive OPEN retains only an uncertain name
     assert.equal(f.ssh.sftpStats.exclusiveCreates, 0);
     assert.equal(f.ssh.sftpStats.removals, 0);
     assert.equal(f.ssh.authenticatedConnections, 1);
-  } finally { await f.close(); }
+  } finally { await assertIncompleteFixtureClose(f); }
 });
 
 test('real protocol: acknowledged mkdir remains partial progress after post-check channel loss', { timeout: 20000 }, async () => {
@@ -396,12 +397,35 @@ for (const type of [3, 6]) {
       assert.equal(actual.size, type === 3 ? 0n : BigInt(bytes.length));
       if (type === 6) assert.deepEqual(await fs.readFile(owned.path), bytes);
     } finally {
-      try { await f.close(); }
+      try { await assertIncompleteFixtureClose(f); }
       finally {
         // The fixture creator can remove its proven residual after teardown.
         // The product must NOT infer this ownership from an unacknowledged OPEN.
         if (owned) await unlinkOwnedFile(owned.path, owned.identity);
       }
     }
+  });
+}
+
+async function assertIncompleteFixtureClose(f: { close(): Promise<void> }): Promise<void> {
+  // Only deliberately uncertain OPEN/WRITE tests use this stricter contract.
+  // fixture.close still attempts client/app/SSH and asserts openHandles === 0
+  // before throwing. Never globally tolerate teardown or unrelated failures.
+  await assert.rejects(f.close(), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors.length, 1);
+    const failure: unknown = error.errors[0];
+    assert.ok(failure instanceof CleanupError);
+    assert.equal(failure.code, 'TRANSFER_CLEANUP_FAILED');
+    assert.equal(failure.failureCount, 1);
+    assert.equal(failure.failures.length, 1);
+    const row = failure.failures[0]!;
+    assert.equal(row.resource, 'transfer');
+    assert.equal(row.code, 'TRANSFER_CLEANUP_FAILED');
+    assert.equal((row.facts?.cleanup as { complete?: boolean } | undefined)?.complete, false);
+    assert.equal(failure.details.cleanupFailureCount, 1);
+    assert.equal(failure.details.cleanupFailuresComplete, true);
+    assert.deepEqual(failure.details.cleanupFailures, failure.failures);
+    return true;
   });
 }

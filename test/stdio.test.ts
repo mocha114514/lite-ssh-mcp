@@ -11,7 +11,15 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const cli = resolve('dist/cli.js');
 
-test('shutdown during paused initialization never attaches a new stdio transport', { timeout: 12_000 }, async () => {
+// After the pause is released, a fresh Windows bootstrap still performs native
+// permission checks before exiting. These finite test-only waits include that
+// work; production shutdown behavior and all exit/output/config assertions stay.
+const pausedInitializationTestTimeoutMs = process.platform === 'win32' ? 30_000 : 12_000;
+const pausedInitializationExitTimeoutMs = process.platform === 'win32' ? 15_000 : 5_000;
+
+test('shutdown during paused initialization never attaches a new stdio transport', {
+  timeout: pausedInitializationTestTimeoutMs,
+}, async () => {
   const fakeHome = fixtureRoot('first-run/stdio-stop', `${process.pid}-${Date.now()}`);
   await fs.mkdir(fakeHome, { recursive: true, mode: 0o700 });
   const hook = join(fakeHome, 'pause-initialization.mjs');
@@ -51,7 +59,12 @@ process.on('message', control);
     child.send('release');
     const [code, signal] = await Promise.race([
       exited,
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('CLI remained alive after shutdown during initialization.')), 5000); }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('CLI remained alive after shutdown during initialization.')),
+          pausedInitializationExitTimeoutMs,
+        );
+      }),
     ]);
     assert.equal(code, 0);
     assert.equal(signal, null);
