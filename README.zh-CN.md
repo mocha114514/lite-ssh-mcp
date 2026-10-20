@@ -37,7 +37,7 @@ AI 负责调用工具；你只需要接入服务、配置 SSH 连接，再用自
       "command": "npx",
       "args": [
         "-y",
-        "lite-ssh-mcp@0.1.0"
+        "lite-ssh-mcp@latest"
       ]
     }
   }

@@ -37,7 +37,7 @@ Add the server to your MCP client, adapting the configuration format to your cli
       "command": "npx",
       "args": [
         "-y",
-        "lite-ssh-mcp@0.1.0"
+        "lite-ssh-mcp@latest"
       ]
     }
   }
