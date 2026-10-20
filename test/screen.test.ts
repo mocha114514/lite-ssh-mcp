@@ -15,13 +15,15 @@ import { LiteSshError } from '../src/core/errors.js';
 import type { ParsedLine, ShellMarker } from '../src/core/types.js';
 import { encodeMarkerOsc } from '../src/shell/protocol.js';
 import { ScreenModel } from '../src/terminal/screen.js';
+import { createShellMarkers } from './helpers/shell-markers.js';
 
 const NONCE = 'm0-test-nonce';
 
 test('R01 BEGIN flushes pre-execution echo before resetting the command body', async () => {
   const h = harness(80, 3);
+  const markers = createShellMarkers(NONCE, 1);
   try {
-    await h.model.write('prompt$ typed-echo' + encodeMarkerOsc(NONCE, 'BEGIN') + 'OK\r\n' + encodeMarkerOsc(NONCE, 'END;0'));
+    await h.model.write('prompt$ typed-echo' + markers.begin() + 'OK\r\n' + markers.end(0, true));
     assert.ok(h.events.indexOf('line:prompt$ typed-echo:true') < h.events.indexOf('marker:begin'));
     assert.deepEqual(h.lines.map(line => line.text), ['prompt$ typed-echo', 'OK']);
   } finally { h.model.dispose(); }
@@ -95,8 +97,9 @@ test('R02 cursor-only CSI keeps a wrapped 501-character body below the preview l
 
 test('R02 backward cursor addressing records changed earlier cells but not unchanged later rows', async () => {
   const h = harness();
+  const markers = createShellMarkers(NONCE, 1);
   try {
-    await h.model.write('ABC\r\nDEF\x1b[1;1HXYZ\r\n' + encodeMarkerOsc(NONCE, 'END;0'));
+    await h.model.write('ABC\r\nDEF\x1b[1;1HXYZ\r\n' + markers.end(0, true));
     h.model.flushLine();
     const body = h.lines.map(line => line.text + (line.newline ? '\n' : '')).join('');
     assert.ok(body.includes('XYZ'), 'the old last-row threshold must not hide the rewritten earlier row');
@@ -109,10 +112,11 @@ test('R02 backward cursor addressing records changed earlier cells but not uncha
 test('R02 dedup of cursor-only movement retains styled frames and actual cursor coordinates', async () => {
   const lines: ParsedLine[] = [];
   const frames: ReturnType<ScreenModel['snapshot']>[] = [];
+  const markers = createShellMarkers(NONCE, 1);
   const model = new ScreenModel({ nonce: NONCE, cols: 20, rows: 3,
     onLine: line => lines.push(line), onFrame: frame => frames.push(frame) });
   try {
-    const snapshot = await model.write('\x1b[31mABC\x1b[1C' + encodeMarkerOsc(NONCE, 'END;0'));
+    const snapshot = await model.write('\x1b[31mABC\x1b[1C' + markers.end(0, true));
     assert.equal(lines.map(line => line.text).join(''), 'ABC');
     assert.ok(frames.some(frame => frame.lines[0] === 'ABC' && frame.styles.length > 0));
     assert.deepEqual(snapshot.cursor, { x: 4, y: 0 });
@@ -425,6 +429,7 @@ test('a backspace overwrite keeps the old text and the final readable text', asy
 test('one chunk with text, erase and END retains the text and reports a frame', async () => {
   const lines: ParsedLine[] = [];
   const frames: { label?: string; first: string }[] = [];
+  const markers = createShellMarkers(NONCE, 1);
   const model = new ScreenModel({
     nonce: NONCE,
     cols: 80,
@@ -434,7 +439,7 @@ test('one chunk with text, erase and END retains the text and reports a frame', 
   });
   // `CSI 2J` erases the screen and `CSI H` homes the cursor; the text has no LF.
   await model.write('abc\x1b[2J\x1b[H');
-  await model.write(encodeMarkerOsc(NONCE, 'END;0'));
+  await model.write(markers.end(0, true));
   assert.deepEqual(lines.map((l) => l.text).join(''), 'abc');
   const erase = frames.find((f) => f.label?.startsWith('erase'));
   assert.ok(erase, 'a pre-erase frame is reported');
@@ -509,14 +514,15 @@ test('every record sets newline = !wrapped so partials carry no break', async ()
 
 test('END flushes the current partial line before onMarker(end)', async () => {
   const h = harness();
+  const markers = createShellMarkers(NONCE, 1);
   await h.model.write('typing');
-  await h.model.write(encodeMarkerOsc(NONCE, 'END;3'));
+  await h.model.write(markers.end(3, true));
   const lineIndex = h.events.findIndex((e) => e.startsWith('line:typing'));
   const endIndex = h.events.indexOf('marker:end');
   assert.ok(lineIndex >= 0, 'partial line should be flushed');
   assert.ok(endIndex > lineIndex, 'END marker should arrive after the flush');
   const end = h.markers.find((m) => m.kind === 'end');
-  assert.deepEqual(end, { nonce: NONCE, kind: 'end', exitCode: 3 });
+  assert.deepEqual(end, { nonce: NONCE, kind: 'end', sequence: 1, exitCode: 3, hookHealthy: true });
   h.model.dispose();
 });
 
@@ -525,13 +531,13 @@ test('decodes every marker kind with its nonce', async () => {
   await h.model.write(encodeMarkerOsc(NONCE, 'PROBE;bash'));
   await h.model.write(encodeMarkerOsc(NONCE, 'STTY;500:5:bf'));
   await h.model.write(encodeMarkerOsc(NONCE, 'READY;zsh'));
-  await h.model.write(encodeMarkerOsc(NONCE, 'BEGIN'));
+  await h.model.write(encodeMarkerOsc(NONCE, 'BEGIN;1'));
   await h.model.write(encodeMarkerOsc(NONCE, 'UNSUPPORTED;no-hooks'));
   assert.deepEqual(h.markers, [
     { nonce: NONCE, kind: 'probe', shell: 'bash' },
     { nonce: NONCE, kind: 'stty', value: '500:5:bf' },
     { nonce: NONCE, kind: 'ready', shell: 'zsh' },
-    { nonce: NONCE, kind: 'begin' },
+    { nonce: NONCE, kind: 'begin', sequence: 1 },
     { nonce: NONCE, kind: 'unsupported', reason: 'no-hooks' },
   ]);
   h.model.dispose();
@@ -539,9 +545,9 @@ test('decodes every marker kind with its nonce', async () => {
 
 test('rejects wrong nonce, unknown events and malformed fields', async () => {
   const h = harness();
-  await h.model.write(encodeMarkerOsc('other-nonce', 'BEGIN'));
+  await h.model.write(encodeMarkerOsc('other-nonce', 'BEGIN;1'));
   await h.model.write(encodeMarkerOsc(NONCE, 'BOGUS'));
-  await h.model.write(encodeMarkerOsc(NONCE, 'END;not-a-number'));
+  await h.model.write(encodeMarkerOsc(NONCE, 'END;1;not-a-number;1'));
   await h.model.write(encodeMarkerOsc(NONCE, 'READY;tcsh'));
   await h.model.write(encodeMarkerOsc(NONCE, 'PROBE;'));
   assert.equal(h.markers.length, 0);
@@ -615,7 +621,7 @@ test('a partial OSC sequence keeps the revision unchanged', async () => {
   const partial = await h.model.write('\x1b]777;LSSH;' + NONCE + ';BE');
   assert.equal(partial.revision, before.revision);
   // Completing it still changes nothing visible on the grid.
-  const completed = await h.model.write('GIN\x07');
+  const completed = await h.model.write('GIN;1\x07');
   assert.equal(completed.revision, before.revision);
   assert.equal(h.markers.at(-1)?.kind, 'begin');
   h.model.dispose();
@@ -652,10 +658,11 @@ test('a real mode change increments the revision', async () => {
 
 test('marker callbacks fire even when the revision does not advance', async () => {
   const h = harness();
+  const markers = createShellMarkers(NONCE, 1);
   const before = await h.model.write('ok');
-  const after = await h.model.write(encodeMarkerOsc(NONCE, 'END;7'));
+  const after = await h.model.write(markers.end(7, true));
   assert.equal(after.revision, before.revision);
-  assert.deepEqual(h.markers.at(-1), { nonce: NONCE, kind: 'end', exitCode: 7 });
+  assert.deepEqual(h.markers.at(-1), { nonce: NONCE, kind: 'end', sequence: 1, exitCode: 7, hookHealthy: true });
   h.model.dispose();
 });
 
@@ -711,9 +718,10 @@ test('alt-screen enter+text+exit in one chunk keeps the outgoing text and frame'
 
 test('a 1201-character line with no LF is aggregated exactly before END', async () => {
   const h = harness(80, 24);
+  const markers = createShellMarkers(NONCE, 1);
   const payload = 'A'.repeat(1201);
   await h.model.write(payload);
-  await h.model.write(encodeMarkerOsc(NONCE, 'END;0'));
+  await h.model.write(markers.end(0, true));
   assert.equal(h.lines.map((l) => l.text).join(''), payload);
   assert.equal(h.lines.map((l) => l.text).join('').length, 1201);
   assert.ok(h.lines.every((l) => l.wrapped === true));
@@ -722,11 +730,12 @@ test('a 1201-character line with no LF is aggregated exactly before END', async 
 
 test('a flush after scrolling does not duplicate the already-emitted prefix', async () => {
   const h = harness(10, 5);
+  const markers = createShellMarkers(NONCE, 1);
   // 3000 columns over 10-wide rows is far past the 5-row screen: most rows are
   // flushed at scroll time, then the tail is completed with an END and an LF.
   const payload = Array.from({ length: 3000 }, (_, i) => String(i % 10)).join('');
   await h.model.write(payload);
-  await h.model.write(encodeMarkerOsc(NONCE, 'END;0'));
+  await h.model.write(markers.end(0, true));
   assert.equal(h.lines.map((l) => l.text).join(''), payload);
   await h.model.write('\r\n');
   assert.equal(h.lines.map((l) => l.text).join(''), payload);
@@ -748,11 +757,12 @@ test('soft-wrap keeps printed spaces so a wide line is not collapsed', async () 
 
 test('a 30000-character line with no LF survives scrollback eviction exactly', async () => {
   const h = harness(10, 5);
+  const markers = createShellMarkers(NONCE, 1);
   // 3000 rows of 10 columns: far past the default 1000-line scrollback, so most
   // rows are trimmed. Character-offset dedup must still emit each exactly once.
   const payload = 'A'.repeat(30000);
   await h.model.write(payload);
-  await h.model.write(encodeMarkerOsc(NONCE, 'END;0'));
+  await h.model.write(markers.end(0, true));
   assert.equal(h.lines.map((l) => l.text).join(''), payload);
   assert.equal(h.lines.map((l) => l.text).join('').length, 30000);
   h.model.dispose();
@@ -776,12 +786,13 @@ test('repeated identical lines past scrollback keep exact counts', async () => {
 
 test('chunked writes around a trim flush the long line exactly once', async () => {
   const h = harness(10, 5);
+  const markers = createShellMarkers(NONCE, 1);
   const payload = Array.from({ length: 30000 }, (_, i) => String(i % 10)).join('');
   // Write in small chunks so flushes interleave with trimming.
   for (let index = 0; index < payload.length; index += 777) {
     await h.model.write(payload.slice(index, index + 777));
   }
-  await h.model.write(encodeMarkerOsc(NONCE, 'END;0'));
+  await h.model.write(markers.end(0, true));
   assert.equal(h.lines.map((l) => l.text).join(''), payload);
   // Completing the line afterwards must not repeat the already-emitted prefix.
   await h.model.write('\r\n');
@@ -806,9 +817,10 @@ for (const [label, unit, cols] of [
 ] as const) {
   test(`true scrollback eviction retains ${label} without column/UTF-16 confusion`, async () => {
     const h = harness(cols, 5);
+    const markers = createShellMarkers(NONCE, 1);
     const payload = unit.repeat(15_000);
     try {
-      await h.model.write(payload + encodeMarkerOsc(NONCE, 'END;0'));
+      await h.model.write(payload + markers.end(0, true));
       assert.equal(h.lines.map(line => line.text).join(''), payload);
       assert.equal(h.lines.reduce((count, line) => count + Array.from(line.text).length, 0), Array.from(payload).length);
       assert.ok(h.lines.every(line => line.newline === false));
@@ -818,6 +830,7 @@ for (const [label, unit, cols] of [
 
 test('split UTF-8 writes retain a mixed Unicode line across true eviction', async () => {
   const h = harness(13, 5);
+  const markers = createShellMarkers(NONCE, 1);
   const payload = 'A\u0301界😀 '.repeat(5000);
   const bytes = Buffer.from(payload, 'utf8');
   try {
@@ -825,15 +838,16 @@ test('split UTF-8 writes retain a mixed Unicode line across true eviction', asyn
       await h.model.write(bytes.subarray(offset, offset + 777));
       h.model.flushLine();
     }
-    await h.model.write(encodeMarkerOsc(NONCE, 'END;0'));
+    await h.model.write(markers.end(0, true));
     assert.equal(h.lines.map(line => line.text).join(''), payload);
   } finally { h.model.dispose(); }
 });
 
 test('an erase followed by identical glyphs is new readable output', async () => {
   const h = harness();
+  const markers = createShellMarkers(NONCE, 1);
   try {
-    await h.model.write('abc\x1b[2J\x1b[Habc' + encodeMarkerOsc(NONCE, 'END;0'));
+    await h.model.write('abc\x1b[2J\x1b[Habc' + markers.end(0, true));
     assert.equal(h.lines.map(line => line.text).join(''), 'abcabc');
     assert.equal(h.model.snapshot().lines[0], 'abc');
   } finally { h.model.dispose(); }

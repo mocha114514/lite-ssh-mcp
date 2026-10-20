@@ -32,8 +32,8 @@ export type ShellMarker = { nonce: string } & (
   | { kind: 'probe'; shell: string }
   | { kind: 'stty'; value: string }
   | { kind: 'ready'; shell: ShellKind }
-  | { kind: 'begin' }
-  | { kind: 'end'; exitCode: number; hookHealthy?: boolean }
+  | { kind: 'begin'; sequence: number }
+  | { kind: 'end'; sequence: number; exitCode: number; hookHealthy: boolean }
   | { kind: 'unsupported'; reason: string }
 );
 export interface ScreenModes {

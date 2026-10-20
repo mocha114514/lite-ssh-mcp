@@ -87,7 +87,8 @@ function fixture(options: { shell?: string; retained?: boolean; ptyFailure?: boo
     path: 'synthetic-owned-cache-no-physical-file',
     recordLine: () => undefined,
     recordFrame: () => undefined,
-    recordStep: () => undefined,
+    recordStep: () => 'S1',
+    recordStepOutcome: () => undefined,
     beginRound: () => 'R1',
     flush: async () => undefined,
     close: async () => {

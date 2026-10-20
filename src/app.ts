@@ -14,25 +14,50 @@ export function createApplication(options: TerminalServiceOptions & { configPath
   let stopping = false;
   const server = createMcpServer(store, pool, terminals, transfers, () => stopping);
   let closing: Promise<void> | undefined;
-  return { store, pool, terminals, transfers, server, close: (): Promise<void> => {
-    // Close admission synchronously, including config/trust tools, before any
-    // asynchronous owned-terminal cleanup can yield back to the dispatcher.
-    stopping = true;
-    closing ??= (async () => {
-      // Terminals and transfers release independent leases before the shared
-      // connection pool is ended. Terminal close never owns transfer teardown.
-      const cleanup = new CleanupFailures();
-      await Promise.all([
-        cleanup.attempt('terminal', () => terminals.dispose(false), 'TERMINAL_CLEANUP_FAILED'),
-        cleanup.attempt('transfer', () => transfers.dispose(), 'TRANSFER_CLEANUP_FAILED')
-      ]);
-      // Every remaining finalizer is attempted, even after an earlier error.
-      // Ending the pool also resolves pending physical-close ownership tickets;
-      // detaching stdio must never be skipped or replace the earlier failure.
-      await cleanup.attempt('connection', () => pool.dispose(), 'CONNECTION_CLEANUP_FAILED');
-      await cleanup.attempt('mcp', () => server.close(), 'MCP_CLOSE_FAILED');
-      cleanup.throwIfAny();
-    })();
-    return closing;
-  } };
+
+  return {
+    store,
+    pool,
+    terminals,
+    transfers,
+    server,
+    close: (): Promise<void> => {
+      // Close admission synchronously for both MCP dispatch and Store operations,
+      // ensuring immediate SERVER_STOPPING rejection before any async teardown begins.
+      stopping = true;
+      if (closing !== undefined) return closing;
+
+      let storeTeardown: Promise<void>;
+      try {
+        storeTeardown = store.close();
+      } catch (error: unknown) {
+        storeTeardown = Promise.reject(error);
+      }
+      void storeTeardown.catch(() => undefined);
+
+      closing = (async () => {
+        const cleanup = new CleanupFailures();
+
+        // Terminal and transfer teardown start immediately without waiting for Store.
+        // Independent errors are captured fully by the aggregate.
+        await Promise.all([
+          cleanup.attempt('terminal', () => terminals.dispose(false), 'TERMINAL_CLEANUP_FAILED'),
+          cleanup.attempt('transfer', () => transfers.dispose(), 'TRANSFER_CLEANUP_FAILED')
+        ]);
+
+        // Connection pool disposal preserves completion of terminals and transfers.
+        await cleanup.attempt('connection', () => pool.dispose(), 'CONNECTION_CLEANUP_FAILED');
+
+        // Store business and lock cleanup must finish before server/MCP transport detachment.
+        await cleanup.attempt('configuration', () => storeTeardown, 'CONFIG_CLEANUP_FAILED');
+
+        // Server detachment is always attempted, even after preceding cleanup errors.
+        await cleanup.attempt('mcp', () => server.close(), 'MCP_CLOSE_FAILED');
+
+        cleanup.throwIfAny();
+      })();
+
+      return closing;
+    }
+  };
 }

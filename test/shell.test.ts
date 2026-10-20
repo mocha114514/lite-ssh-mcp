@@ -57,7 +57,7 @@ test('probe rejects unsafe nonces', () => {
 test('bash prepends BEGIN to the existing PS0 instead of replacing it', () => {
   const script = makeShellBootstrap('bash', NONCE, '');
   // Existing PS0 text survives, and an unset variable is safe under nounset.
-  assert.ok(script.includes("PS0=$'\\033]777;LSSH;" + NONCE + ";BEGIN\\007'\"${PS0-}\""));
+  assert.ok(script.includes("PS0=$'\\033]777;LSSH;" + NONCE + ";BEGIN;1\\007'\"${PS0-}\""));
 });
 
 test('bash keeps its PROMPT_COMMAND shape and leaves the DEBUG trap alone', () => {
@@ -78,7 +78,7 @@ test('bash captures the exit status first and emits READY from the first prompt'
   assert.ok(new RegExp(ID + 'precmd\\(\\) \\{ local ' + ID + 'ec=\\$\\?;').test(script));
   const precmd = script.indexOf(ID + 'precmd() {');
   const ready = script.indexOf('READY;bash');
-  const end = script.indexOf('END;%d');
+  const end = script.indexOf('END;%d;%d;%d');
   assert.ok(precmd >= 0);
   assert.ok(ready > precmd, 'READY must be emitted inside the prompt hook, not the bootstrap');
   assert.ok(end > precmd);
@@ -158,14 +158,14 @@ test('fish posterror emits END once and never a synthetic BEGIN', () => {
   // Parser-rejected input never ran, so posterror must not open a round.
   assert.ok(!posterror.includes(';BEGIN'));
   // It still reports the (real, non-zero) status as a single END.
-  assert.ok(posterror.includes('END;%d'));
+  assert.ok(posterror.includes('END;%d;%d;%d'));
   assert.ok(posterror.includes('$' + ID + 'ec'));
   // The round flag is cleared so a following postexec cannot add a second END.
   assert.ok(posterror.includes('set -g ' + ID + 'round 0'));
   // Only the preexec handler is allowed to emit BEGIN.
   const preexec = script.slice(script.indexOf('preexec --on-event'), script.indexOf('postexec'));
-  assert.ok(preexec.includes(';BEGIN'));
-  assert.equal(script.split(';BEGIN' + '\\007').length - 1, 1);
+  assert.ok(preexec.includes(';BEGIN;%d'));
+  assert.equal(script.split(';BEGIN;%d' + '\\007').length - 1, 1);
 });
 
 test('fish captures $status before anything else in postexec/posterror', () => {
@@ -209,27 +209,32 @@ test('every bootstrap marker carries the nonce and printable escapes', () => {
   }
 });
 
-test('F03 parseMarker preserves legacy END shape and decodes explicit hook health', () => {
-  assert.deepEqual(parseMarker('LSSH;test;END;0', 'test'), {
+test('F03 parseMarker decodes explicit sequence, status and hook health', () => {
+  assert.deepEqual(parseMarker('LSSH;test;END;1;0;1', 'test'), {
     nonce: 'test',
     kind: 'end',
-    exitCode: 0,
-  });
-  assert.deepEqual(parseMarker('LSSH;test;END;0;1', 'test'), {
-    nonce: 'test',
-    kind: 'end',
+    sequence: 1,
     exitCode: 0,
     hookHealthy: true,
   });
-  assert.deepEqual(parseMarker('LSSH;test;END;0;0', 'test'), {
+  assert.deepEqual(parseMarker('LSSH;test;END;2;0;1', 'test'), {
     nonce: 'test',
     kind: 'end',
+    sequence: 2,
+    exitCode: 0,
+    hookHealthy: true,
+  });
+  assert.deepEqual(parseMarker('LSSH;test;END;3;0;0', 'test'), {
+    nonce: 'test',
+    kind: 'end',
+    sequence: 3,
     exitCode: 0,
     hookHealthy: false,
   });
-  assert.deepEqual(parseMarker('LSSH;test;END;130;1', 'test'), {
+  assert.deepEqual(parseMarker('LSSH;test;END;4;130;1', 'test'), {
     nonce: 'test',
     kind: 'end',
+    sequence: 4,
     exitCode: 130,
     hookHealthy: true,
   });
@@ -238,21 +243,23 @@ test('F03 parseMarker preserves legacy END shape and decodes explicit hook healt
 test('F03 bash bootstrap checks installed PS0 prefix for hook health without promptvars dependency', () => {
   const script = makeShellBootstrap('bash', NONCE, '');
   assert.ok(!script.includes('shopt -q promptvars'));
-  assert.ok(script.includes('local ' + ID + 'ps0="${PS0-}";'));
-  assert.ok(script.includes('"${' + ID + 'ps0#$\'\\033]777;LSSH;' + NONCE + ';BEGIN\\007\'}" != "$' + ID + 'ps0"'));
-  assert.ok(script.includes('END;%d;%d'));
+  assert.ok(script.includes('local ' + ID + 'ps0="${PS0-}"'));
+  assert.ok(script.includes('"${' + ID + 'ps0#$\'\\033]777;LSSH;' + NONCE + ';BEGIN;\'}"'));
+  assert.ok(script.includes('[ "$' + ID + 'tail" != "$' + ID + 'ps0" ]'));
+  assert.ok(script.includes('[ "$' + ID + 'tail" != "$' + ID + 'digits" ]'));
+  assert.ok(script.includes('END;%d;%d;%d'));
 });
 
 test('F03 zsh bootstrap checks function definition and preexec_functions binding for hook health', () => {
   const script = makeShellBootstrap('zsh', NONCE, '');
   assert.ok(script.includes('$+functions[' + ID + 'preexec]'));
   assert.ok(script.includes('preexec_functions[(Ie)' + ID + 'preexec]'));
-  assert.ok(script.includes('END;%d;%d'));
+  assert.ok(script.includes('END;%d;%d;%d'));
 });
 
 test('F03 fish bootstrap checks function definition and on-event binding for hook health', () => {
   const script = makeShellBootstrap('fish', NONCE, '');
   assert.ok(script.includes('functions -q ' + ID + 'preexec'));
   assert.ok(script.includes("string match -q -r '^function[[:space:]]+.*--on-event[[:space:]]+fish_preexec' (functions " + ID + 'preexec 2>/dev/null)'));
-  assert.ok(script.includes('END;%d;%d'));
+  assert.ok(script.includes('END;%d;%d;%d'));
 });

@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { LiteSshError } from '../core/errors.js';
+import { CleanupFailures } from '../core/cleanup.js';
 import { endpointKey, loginKey, normalizeIp } from '../core/targets.js';
 import type { Endpoint, LoginTarget, ResolvedLogin } from '../core/types.js';
 import { isFingerprint } from './fingerprint.js';
@@ -49,37 +50,89 @@ function revisionOf(entry: LoginEntry): string {
 export class ConfigStore {
   readonly filePath: string;
   private retainedConfirmations = 0;
+  private stopping = false;
+  private readonly business = new Set<Promise<unknown>>();
+  private closingPromise: Promise<void> | undefined;
 
   constructor(filePath: string = defaultConfigPath()) {
     this.filePath = filePath;
   }
 
+  /**
+   * Execute an accepted business operation, registering its work promise in the
+   * active business set synchronously BEFORE the operation callback is invoked.
+   */
+  private executeTracked<T>(operation: () => Promise<T>): Promise<T> {
+    const work = Promise.resolve().then(operation);
+    this.business.add(work);
+    void work.then(
+      () => {
+        this.business.delete(work);
+      },
+      () => {
+        this.business.delete(work);
+      }
+    );
+    return work;
+  }
+
   /** All configured login combinations, with credentials and paths stripped. */
-  async listConfigurations(): Promise<LoginTarget[]> {
-    const view = await this.load();
-    return view.list.map((target) => ({ ip: target.ip, port: target.port, username: target.username }));
+  listConfigurations(): Promise<LoginTarget[]> {
+    if (this.stopping) {
+      return Promise.reject(new LiteSshError('SERVER_STOPPING', 'The configuration store is shutting down.'));
+    }
+    return this.executeTracked(async () => {
+      const view = await this.load();
+      return view.list.map((target) => ({
+        ip: target.ip,
+        port: target.port,
+        username: target.username
+      }));
+    });
   }
 
   /** Resolve one login combination to its credential branch and trust pin. */
-  async resolveLogin(target: LoginTarget): Promise<ResolvedLogin> {
-    const key = loginKey(target); // validates ip, port and username
-    const view = await this.load();
-    const entry = view.logins.get(key);
-    if (entry === undefined) {
-      if (!view.endpoints.has(endpointKey({ ip: target.ip, port: target.port }))) {
-        throw new LiteSshError('CONFIG_NOT_FOUND', 'The requested endpoint is not present in the configuration.');
-      }
-      throw new LiteSshError('ACCOUNT_NOT_FOUND', 'The requested account is not present in the configuration.');
+  resolveLogin(target: LoginTarget): Promise<ResolvedLogin> {
+    let key: string;
+    try {
+      key = loginKey(target); // validates ip, port and username
+    } catch (error) {
+      return Promise.reject(error);
     }
-    const resolved: ResolvedLogin = {
-      target: { ip: entry.ip, port: entry.port, username: entry.username },
-      auth: entry.auth.type === 'password'
-        ? { type: 'password', password: entry.auth.password }
-        : { type: 'privateKey', privateKeyPath: entry.auth.privateKeyPath, ...(entry.auth.passphrase !== undefined ? { passphrase: entry.auth.passphrase } : {}) },
-      revision: revisionOf(entry),
-    };
-    if (entry.hostKeyFingerprint !== undefined) resolved.hostKeyFingerprint = entry.hostKeyFingerprint;
-    return resolved;
+
+    if (this.stopping) {
+      return Promise.reject(new LiteSshError('SERVER_STOPPING', 'The configuration store is shutting down.'));
+    }
+
+    return this.executeTracked(async () => {
+      const view = await this.load();
+      const entry = view.logins.get(key);
+      if (entry === undefined) {
+        if (!view.endpoints.has(endpointKey({ ip: target.ip, port: target.port }))) {
+          throw new LiteSshError('CONFIG_NOT_FOUND', 'The requested endpoint is not present in the configuration.');
+        }
+        throw new LiteSshError('ACCOUNT_NOT_FOUND', 'The requested account is not present in the configuration.');
+      }
+      const resolved: ResolvedLogin = {
+        target: {
+          ip: entry.ip,
+          port: entry.port,
+          username: entry.username
+        },
+        auth: entry.auth.type === 'password'
+          ? { type: 'password', password: entry.auth.password }
+          : {
+              type: 'privateKey',
+              privateKeyPath: entry.auth.privateKeyPath,
+              ...(entry.auth.passphrase !== undefined ? { passphrase: entry.auth.passphrase } : {})
+            },
+        revision: revisionOf(entry)
+      };
+      if (entry.hostKeyFingerprint !== undefined) {
+        resolved.hostKeyFingerprint = entry.hostKeyFingerprint;
+      }
+      return resolved;
+    });
   }
 
   /**
@@ -91,27 +144,78 @@ export class ConfigStore {
    * re-read under the lock and a temporary sibling is written with `wx`/0600
    * and renamed over the configuration so readers never observe a partial file.
    */
-  async confirmHostKey(endpoint: Endpoint, fingerprint: string, guard?: HostKeyConfirmationGuard): Promise<{ changed: boolean; fingerprint: string }> {
-    const ip = normalizeIp(endpoint.ip);
-    const port = endpoint.port;
-    endpointKey({ ip, port }); // validate the port range
-    if (!isFingerprint(fingerprint)) {
-      throw new LiteSshError('CONFIG_INVALID', 'The fingerprint must use the SHA256 standard base64 form.');
+  confirmHostKey(
+    endpoint: Endpoint,
+    fingerprint: string,
+    guard?: HostKeyConfirmationGuard
+  ): Promise<{ changed: boolean; fingerprint: string }> {
+    let ip: string;
+    let port: number;
+    try {
+      ip = normalizeIp(endpoint.ip);
+      port = endpoint.port;
+      endpointKey({ ip, port }); // validate the port range
+      if (!isFingerprint(fingerprint)) {
+        throw new LiteSshError('CONFIG_INVALID', 'The fingerprint must use the SHA256 standard base64 form.');
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    if (this.stopping) {
+      return Promise.reject(new LiteSshError('SERVER_STOPPING', 'The configuration store is shutting down.'));
     }
 
     // Readers and native permission helpers have later admission points. Hold
     // this independent work credit before even the first directory/lock await.
     if (this.retainedConfirmations >= MAX_HOST_KEY_CONFIRMATIONS) {
-      throw new LiteSshError('RESOURCE_LIMIT', 'Too many host-key confirmations are awaiting completion.');
+      return Promise.reject(new LiteSshError('RESOURCE_LIMIT', 'Too many host-key confirmations are awaiting completion.'));
     }
     this.retainedConfirmations++;
-    try {
-      // Await the business finalizers: returning its promise directly would
-      // retire this credit early. SDK observation cancellation is not retirement.
-      return await this.performConfirmation({ ip, port }, fingerprint, guard);
-    } finally {
-      this.retainedConfirmations--;
-    }
+
+    return this.executeTracked(async () => {
+      try {
+        // Await the business finalizers: returning its promise directly would
+        // retire this credit early. SDK observation cancellation is not retirement.
+        return await this.performConfirmation({ ip, port }, fingerprint, guard);
+      } finally {
+        this.retainedConfirmations--;
+      }
+    });
+  }
+
+  /**
+   * Synchronously stop admission of new queries and confirmations, and wait for
+   * all accepted in-flight operations in the initial cohort to settle.
+   * Historical already-settled failures do not make shutdown fail.
+   */
+  close(): Promise<void> {
+    this.stopping = true;
+    this.closingPromise ??= (async () => {
+      // Capture unsettled cohort only at the moment close() is first called.
+      const cohort = Array.from(this.business);
+      if (cohort.length === 0) {
+        return;
+      }
+
+      const outcomes = await Promise.allSettled(cohort);
+      const cleanup = new CleanupFailures();
+      let primaryError: LiteSshError | undefined;
+
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') {
+          const uncertainty = extractCleanupUncertainty(outcome.reason);
+          if (uncertainty !== undefined) {
+            primaryError ??= outcome.reason instanceof LiteSshError ? outcome.reason : undefined;
+            cleanup.add('configuration', outcome.reason, uncertainty.code, uncertainty.facts);
+          }
+        }
+      }
+
+      cleanup.throwIfAny(primaryError ? { error: primaryError } : undefined);
+    })();
+
+    return this.closingPromise;
   }
 
   private async performConfirmation(
@@ -260,6 +364,61 @@ export class ConfigStore {
   }
 }
 
+/**
+ * Extract only whitelisted, bounded boolean facts from known cleanup uncertainty flags.
+ * Gathers all concurrent uncertainties for a single business operation into one facts object.
+ * Raw error messages and secret paths are strictly excluded.
+ */
+function extractCleanupUncertainty(
+  error: unknown
+): { code: string; facts: Record<string, unknown> } | undefined {
+  if (!(error instanceof LiteSshError) || typeof error.details !== 'object' || error.details === null) {
+    return undefined;
+  }
+  const details = error.details as Record<string, unknown>;
+  const facts: Record<string, unknown> = {};
+  let hasUncertainty = false;
+
+  if (details.configurationHandleCloseConfirmed === false) {
+    facts.configurationHandleCloseConfirmed = false;
+    hasUncertainty = true;
+  }
+
+  if (details.temporaryHandleCloseConfirmed === false) {
+    facts.temporaryHandleCloseConfirmed = false;
+    hasUncertainty = true;
+  }
+
+  // A healthy temporary FD close does not prove removal after publication
+  // failed. Project only completion, never residual names or native errors,
+  // into this bounded ownership-fact map.
+  if (details.cleanupComplete === false) {
+    facts.temporaryCleanupComplete = false;
+    hasUncertainty = true;
+  }
+
+  if (details.lockCleanup && typeof details.lockCleanup === 'object') {
+    const lc = details.lockCleanup as Record<string, unknown>;
+    if (lc.handleCloseConfirmed === false || lc.complete === false || lc.removalConfirmed === false) {
+      const lockCleanupFacts: Record<string, unknown> = {};
+      if (typeof lc.complete === 'boolean') lockCleanupFacts.complete = lc.complete;
+      if (typeof lc.removalConfirmed === 'boolean') lockCleanupFacts.removalConfirmed = lc.removalConfirmed;
+      if (typeof lc.handleCloseConfirmed === 'boolean') lockCleanupFacts.handleCloseConfirmed = lc.handleCloseConfirmed;
+      facts.lockCleanup = lockCleanupFacts;
+      hasUncertainty = true;
+    }
+  }
+
+  if (!hasUncertainty) {
+    return undefined;
+  }
+
+  return {
+    code: error.code,
+    facts
+  };
+}
+
 async function atomicWrite(filePath: string, value: JsonObject, beforeCommit?: () => void): Promise<void> {
   const serialized = `${JSON.stringify(value, null, 2)}\n`;
   if (Buffer.byteLength(serialized, 'utf8') > MAX_CONFIG_BYTES) {
@@ -270,33 +429,57 @@ async function atomicWrite(filePath: string, value: JsonObject, beforeCommit?: (
   parseJsonStrict(serialized);
   const directory = path.dirname(filePath);
   await ensurePrivateDirectory(directory);
-  const temporary = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+  const temporary = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
+  );
   const handle = await fs.open(temporary, 'wx', 0o600);
   let identity: PrivateObjectIdentity | undefined;
   let closed = false;
+  let temporaryHandleCloseConfirmed = true;
+
   try {
     identity = await handle.stat({ bigint: true });
     await requirePrivatePath(temporary, 'file', true, handle);
     await handle.writeFile(serialized, 'utf8');
     await handle.sync();
-    await handle.close();
-    closed = true;
+    try {
+      await handle.close();
+      closed = true;
+    } catch {
+      temporaryHandleCloseConfirmed = false;
+      throw new LiteSshError(
+        'CONFIG_WRITE_FAILED',
+        'The temporary configuration file handle could not confirm closure.'
+      );
+    }
     beforeCommit?.();
     await fs.rename(temporary, filePath);
   } catch (error) {
     if (!closed) {
-      try { await handle.close(); } catch { /* ignore */ }
+      try {
+        await handle.close();
+      } catch {
+        temporaryHandleCloseConfirmed = false;
+      }
     }
     let cleanupComplete = false;
     if (identity) {
-      try { await unlinkOwnedFile(temporary, identity); cleanupComplete = true; }
-      catch { /* Preserve the uncertain object and report it, never force-rm. */ }
+      try {
+        await unlinkOwnedFile(temporary, identity);
+        cleanupComplete = true;
+      } catch {
+        /* Preserve the uncertain object and report it, never force-rm. */
+      }
     }
-    const failure = error instanceof LiteSshError ? error
+    const failure = error instanceof LiteSshError
+      ? error
       : new LiteSshError('CONFIG_WRITE_FAILED', 'The configuration update could not be safely written.');
     throw new LiteSshError(failure.code, failure.message, {
-      ...failure.details, cleanupComplete,
-      ...(!cleanupComplete ? { possibleResidualPaths: [temporary] } : {})
+      ...failure.details,
+      cleanupComplete,
+      ...(!cleanupComplete ? { possibleResidualPaths: [temporary] } : {}),
+      ...(temporaryHandleCloseConfirmed === false ? { temporaryHandleCloseConfirmed: false } : {})
     });
   }
 }

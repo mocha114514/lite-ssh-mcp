@@ -330,6 +330,17 @@ export class ReadableRecorder {
     return id;
   }
 
+  /** Append the local queue fact under the original STEP, never input bodies or an ACK. */
+  recordStepOutcome(id: string, requested: number, accepted: number | null): void {
+    if (!/^S[1-9][0-9]*$/.test(id) || !Number.isInteger(requested) || requested < 1 || requested > 64 ||
+        (accepted !== null && accepted !== 0 && accepted !== requested)) {
+      throw new LiteSshError('CACHE_WRITE_FAILED', 'Input handoff metadata could not be recorded safely.');
+    }
+    this.metadataBoundary();
+    const outcome = accepted === null ? 'unknown' : String(accepted);
+    this.enqueue(`${stepMarkerLine(id)} inputActionsRequested=${requested} inputActionsAccepted=${outcome}\n`);
+  }
+
   /**
    * Close the open round, wait for its queued writes to reach disk, and return
    * the bounded summary. A body over the preview limit is returned as

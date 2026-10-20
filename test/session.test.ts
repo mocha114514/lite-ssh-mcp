@@ -10,6 +10,7 @@ import type { ConnectionLease, InputAction, TerminalIdentity, TerminalTarget } f
 import { LiteSshError } from '../src/core/errors.js';
 import { ReadableRecorder } from '../src/cache/recorder.js';
 import { encodeMarkerOsc } from '../src/shell/protocol.js';
+import { createShellMarkers } from './helpers/shell-markers.js';
 import { TerminalSession } from '../src/terminal/session.js';
 import { ScreenModel } from '../src/terminal/screen.js';
 import { SerialQueue } from '../src/core/async.js';
@@ -172,7 +173,14 @@ async function waitForRead(
  * Open a real session over a scripted channel and complete the shell handshake
  * by hand. The recorder is the controlled fake so cache-flush timing is exact.
  */
-async function scriptedSession(tag: string, writeWaitMs = 320): Promise<{ session: TerminalSession; channel: ScriptedChannel; nonce: string; flush: FlushGate }> {
+async function scriptedSession(tag: string, writeWaitMs = 320): Promise<{
+  session: TerminalSession;
+  channel: ScriptedChannel;
+  nonce: string;
+  flush: FlushGate;
+  markers: ReturnType<typeof createShellMarkers>;
+  marker: (payloadOrNonce: string, maybePayload?: string) => string;
+}> {
   const channel = new ScriptedChannel();
   const identity: TerminalIdentity = { ip: '127.0.0.1', port: 22, username: 'scripted', codename: tag };
   const lease: ConnectionLease = {
@@ -186,14 +194,23 @@ async function scriptedSession(tag: string, writeWaitMs = 320): Promise<{ sessio
   const opened = TerminalSession.open(lease, identity, { initializationTimeoutMs: 4000, writeWaitMs, recorder: flush.recorder });
   await waitFor(() => /LSSH;([A-Za-z0-9_.-]+);STTY/.test(channel.outbound.join('')), 'the shell probe');
   const nonce = /LSSH;([A-Za-z0-9_.-]+);STTY/.exec(channel.outbound.join(''))![1]!;
-  feed(channel, `${marker(nonce, 'STTY;0:0:0:0')}${marker(nonce, 'PROBE;bash')}`);
+  const markers = createShellMarkers(nonce, 1);
+  const marker = (payloadOrNonce: string, maybePayload?: string): string => {
+    // Preserve explicit foreign/malformed wire fixtures, never silently replace
+    // a caller-supplied different nonce with this session's authenticated one.
+    if (maybePayload !== undefined && payloadOrNonce !== nonce) {
+      return encodeMarkerOsc(payloadOrNonce, maybePayload);
+    }
+    return markers.marker(maybePayload ?? payloadOrNonce);
+  };
+  feed(channel, `${marker('STTY;0:0:0:0')}${marker('PROBE;bash')}`);
   await waitFor(() => channel.outbound.join('').includes('__lssh_'), 'the shell bootstrap');
-  feed(channel, marker(nonce, 'READY;bash'));
-  return { session: await opened, channel, nonce, flush };
+  feed(channel, marker('READY;bash'));
+  return { session: await opened, channel, nonce, flush, markers, marker };
 }
 
 test('a prompt END observed while the pre-send flush is pending cannot consume the new submission', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce, flush } = await scriptedSession('presend');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('presend');
   try {
     // Hold the cache flush open, then start a submission and deliver the earlier
     // prompt's END while the flush is still pending. Only the private candidate
@@ -220,7 +237,7 @@ test('a prompt END observed while the pre-send flush is pending cannot consume t
 });
 
 test('R02 the real round preview does not omit 501 characters after cursor-only CSI', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r02-preview');
+  const { session, channel, nonce, marker } = await scriptedSession('r02-preview');
   try {
     const outcome = session.write([{ type: 'text', text: 'r02_preview_command' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r02_preview_command\r'), 'preview handoff');
@@ -234,7 +251,7 @@ test('R02 the real round preview does not omit 501 characters after cursor-only 
 });
 
 test('R02 a no-op character erase cannot force a 501-character real preview to be omitted', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r02-preview-padding');
+  const { session, channel, nonce, marker } = await scriptedSession('r02-preview-padding');
   try {
     const outcome = session.write([{ type: 'text', text: 'r02_padding_command' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r02_padding_command\r'), 'padding preview handoff');
@@ -248,7 +265,7 @@ test('R02 a no-op character erase cannot force a 501-character real preview to b
 });
 
 test('R03 pre-CR text followed only by RIS cannot omit a genuine 501-character preview', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r03-ris-cr-preview');
+  const { session, channel, nonce, marker } = await scriptedSession('r03-ris-cr-preview');
   try {
     const outcome = session.write([{ type: 'text', text: 'r03_ris_cr' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r03_ris_cr\r'), 'RIS CR handoff');
@@ -262,7 +279,7 @@ test('R03 pre-CR text followed only by RIS cannot omit a genuine 501-character p
 });
 
 test('R03 RIS replacement preserves the real 1003-character preview omission boundary', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r03-ris-preview');
+  const { session, channel, nonce, marker } = await scriptedSession('r03-ris-preview');
   try {
     const outcome = session.write([{ type: 'text', text: 'r03_ris_command' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r03_ris_command\r'), 'RIS preview handoff');
@@ -326,7 +343,7 @@ test('R03 cancelled post-observation drains retain a bounded whole-input-work cr
 });
 
 test('R02 natural EOF drains every slice of one already-accepted output chunk', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce, flush } = await scriptedSession('r02-eof');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('r02-eof');
   try {
     const outcome = session.write([{ type: 'text', text: 'r02_eof_command' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r02_eof_command\r'), 'EOF handoff');
@@ -351,7 +368,7 @@ test('R02 natural EOF drains every slice of one already-accepted output chunk', 
 });
 
 test('R02 healthy stderr buffered at EOF drains and retains its real END fact', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce, flush } = await scriptedSession('r02-eof-stderr');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('r02-eof-stderr');
   try {
     const outcome = session.write([{ type: 'text', text: 'r02_stderr_command' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r02_stderr_command\r'), 'stderr handoff');
@@ -373,7 +390,7 @@ test('R02 healthy stderr buffered at EOF drains and retains its real END fact', 
 });
 
 test('R02 recording EIO after EOF stops queued parsing and exposes the actual loss reason', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce, flush } = await scriptedSession('r02-eof-eio');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('r02-eof-eio');
   try {
     const outcome = session.write([{ type: 'text', text: 'r02_eof_eio_command' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r02_eof_eio_command\r'), 'EOF EIO handoff');
@@ -397,7 +414,7 @@ test('R02 recording EIO after EOF stops queued parsing and exposes the actual lo
 });
 
 test('R02 cancellation during pre-send flush never becomes a late native handoff', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce, flush } = await scriptedSession('r02-cancel-unsent');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('r02-cancel-unsent');
   const controller = new AbortController();
   try {
     flush.hold();
@@ -417,7 +434,7 @@ test('R02 cancellation during pre-send flush never becomes a late native handoff
 });
 
 test('R02 cancelling an already-sent observer preserves later factual shell rounds', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r02-cancel-facts');
+  const { session, channel, nonce, marker } = await scriptedSession('r02-cancel-facts');
   const controller = new AbortController();
   try {
     const outcome = session.write([{ type: 'text', text: 'r02_cancel_sent' }, { type: 'key', key: 'ENTER' }], controller.signal);
@@ -482,7 +499,7 @@ test('R02 cancelled queued handoffs remain bounded behind a blocked cache flush'
 });
 
 test('R02 public diagnostic details cannot replace authoritative terminal or handoff fields', { timeout: 10_000 }, async t => {
-  const { session, channel, nonce, flush } = await scriptedSession('r02-detail-authority');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('r02-detail-authority');
   try {
     const outcome = session.write([{ type: 'text', text: 'r02_detail_command' }, { type: 'key', key: 'ENTER' }]);
     await waitFor(() => channel.outbound.includes('r02_detail_command\r'), 'diagnostic handoff');
@@ -549,7 +566,7 @@ test('R02 genuine SDK cancellations free observer quota without double release o
 });
 
 test('two overlapping submissions get one cycle each, the later one END-only', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('overlap');
+  const { session, channel, nonce, marker } = await scriptedSession('overlap');
   try {
     const first = session.write([{ type: 'text', text: 'emit small' }, { type: 'key', key: 'RETURN' }]);
     await waitFor(() => channel.outbound.join('').includes('emit small'), 'the first packet');
@@ -580,7 +597,7 @@ test('two overlapping submissions get one cycle each, the later one END-only', {
 });
 
 test('an END-only cycle is a factual completion even when no writer owns it', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('endonly');
+  const { session, channel, nonce, marker } = await scriptedSession('endonly');
   try {
     // R1: a real foreground command that never reads its stdin.
     const running = session.write([{ type: 'text', text: 'sleep' }, { type: 'key', key: 'RETURN' }]);
@@ -647,7 +664,7 @@ test('a mode change during the pre-send flush is honoured at the actual handoff'
 
 // ROUND01 fault regressions use only scripted channels and owned local fixtures.
 test('R01 multiline shell input publishes only actual marked cycles, not every Enter', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r01-multiline');
+  const { session, channel, nonce, marker } = await scriptedSession('r01-multiline');
   try {
     const resultPromise = session.write([
       { type: 'text', text: 'for x in 1; do' }, { type: 'key', key: 'ENTER' },
@@ -671,7 +688,7 @@ test('R01 multiline shell input publishes only actual marked cycles, not every E
 });
 
 test('R01 an earlier owner completes while a later marked command is still running', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r01-owner-running');
+  const { session, channel, nonce, marker } = await scriptedSession('r01-owner-running');
   let later: Promise<Record<string, unknown>> | undefined;
   try {
     const first = session.write([{ type: 'text', text: 'first-owned' }, { type: 'key', key: 'ENTER' }]);
@@ -743,7 +760,7 @@ test('R01 terminal-query replies share a bounded outgoing byte budget', { timeou
 });
 
 test('R01 a cache EIO after handoff retains transmission and integrity context', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce, flush } = await scriptedSession('r01-cache-context');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('r01-cache-context');
   try {
     const outcome = session.write([{ type: 'text', text: 'cache-failure-command' }, { type: 'key', key: 'ENTER' }])
       .catch((error): Record<string, unknown> => ({ thrown: error }));
@@ -767,7 +784,7 @@ test('R01 a cache EIO after handoff retains transmission and integrity context',
 
 
 test('R01 an overlapping writer cannot claim the older batch\'s second actual round', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r01-mixed-batch');
+  const { session, channel, nonce, marker } = await scriptedSession('r01-mixed-batch');
   let batch: Promise<Record<string, unknown>> | undefined;
   try {
     batch = session.write([
@@ -798,7 +815,7 @@ test('R01 an overlapping writer cannot claim the older batch\'s second actual ro
 
 
 test('R01 expiry of a batch observer cannot transfer its delayed second round to a new writer', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r01-expired-batch');
+  const { session, channel, nonce, marker } = await scriptedSession('r01-expired-batch');
   try {
     const older = session.write([
       { type: 'text', text: 'delayed-a1' }, { type: 'key', key: 'ENTER' },
@@ -824,7 +841,7 @@ test('R01 expiry of a batch observer cannot transfer its delayed second round to
 
 
 test('R01 a third overlapping packet cannot restore credit in an already ambiguous batch', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('r01-third-packet');
+  const { session, channel, nonce, marker } = await scriptedSession('r01-third-packet');
   let first: Promise<Record<string, unknown>> | undefined;
   let second: Promise<Record<string, unknown>> | undefined;
   try {
@@ -852,7 +869,7 @@ test('R01 a third overlapping packet cannot restore credit in an already ambiguo
 });
 
 test('F03 hook health false reports SHELL_INTEGRATION_LOST without falseNoExec and self-heals after restoration', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f03-health');
+  const { session, channel, nonce, marker } = await scriptedSession('f03-health');
   try {
     // 1. Hook is broken (e.g. PS0 overwritten), so command runs but BEGIN is not emitted.
     const compromised = session.write([{ type: 'text', text: 'audit_broken_cmd' }, { type: 'key', key: 'ENTER' }]);
@@ -895,7 +912,7 @@ test('F03 hook health false reports SHELL_INTEGRATION_LOST without falseNoExec a
 });
 
 test('F03 a healthy END after repairing the hook cannot erase known BEGIN loss', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce, flush } = await scriptedSession('f03-repair-boundary');
+  const { session, channel, nonce, flush, marker } = await scriptedSession('f03-repair-boundary');
   try {
     // The command that disables the hook still had a real BEGIN. Its unhealthy
     // END must affect future boundaries without erasing this execution fact.
@@ -974,7 +991,7 @@ test('F03 a healthy END after repairing the hook cannot erase known BEGIN loss',
 });
 
 test('F03 an unhealthy END without a reserved cycle is remembered for later repair input', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f03-unowned-health');
+  const { session, channel, nonce, marker } = await scriptedSession('f03-unowned-health');
   try {
     // No input has reserved a candidate yet. Put the visible witness AFTER END
     // so reading it proves this same packet's unhealthy marker was processed.
@@ -1004,7 +1021,7 @@ test('F03 an unhealthy END without a reserved cycle is remembered for later repa
 });
 
 test('F04 bare Ctrl-C followed by Enter does not let late END130 claim new submission; factual command completes normally', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-ctrlc-enter');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-ctrlc-enter');
   try {
     // 1. Bare Ctrl-C sent at prompt
     const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
@@ -1050,7 +1067,7 @@ test('F04 bare Ctrl-C followed by Enter does not let late END130 claim new submi
 });
 
 test('F04 bare Ctrl-C followed by syntax error with single End-only remains unknown, subsequent command is unknown with factual round recorded', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-ambiguous-syntax', 150);
+  const { session, channel, nonce, marker } = await scriptedSession('f04-ambiguous-syntax', 150);
   try {
     // 1. Bare Ctrl-C
     const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
@@ -1086,7 +1103,7 @@ test('F04 bare Ctrl-C followed by syntax error with single End-only remains unkn
 });
 
 test('F04 Ctrl-C followed by syntax error A and command B: B output is not stolen by A', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-ab-syntax');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-ab-syntax');
   try {
     // 1. Bare Ctrl-C at prompt settles with interrupt END130
     const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
@@ -1123,7 +1140,7 @@ test('F04 Ctrl-C followed by syntax error A and command B: B output is not stole
 });
 
 test('F04 bare Ctrl-C with 0 interrupt ENDs followed by command records factual execution', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-0end');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-0end');
   try {
     const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
     await waitFor(() => channel.outbound.join('').includes('\x03'), 'ctrl-c handoff');
@@ -1149,7 +1166,7 @@ test('F04 bare Ctrl-C with 0 interrupt ENDs followed by command records factual 
 });
 
 test('F04 two bare Ctrl-Cs with two late END130s do not claim subsequent command', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-2ctrlc');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-2ctrlc');
   try {
     // Two Ctrl-Cs
     const c1 = session.write([{ type: 'key', key: 'CTRL_C' }]);
@@ -1182,7 +1199,7 @@ test('F04 two bare Ctrl-Cs with two late END130s do not claim subsequent command
 });
 
 test('F04 active queued A cancelled before BEGIN preserves original expired protections from stealing B token', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-cancel-barrier');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-cancel-barrier');
   try {
     // 1. In unstarted candidate phase at prompt, writer A queues input
     const controllerA = new AbortController();
@@ -1217,7 +1234,7 @@ test('F04 active queued A cancelled before BEGIN preserves original expired prot
 });
 
 test('F04 bare Ctrl-C followed by batch packet with multiple Enters escalates to permanent ambiguous ownership', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-batch-multi-enter');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-batch-multi-enter');
   try {
     // 1. Bare Ctrl-C at prompt
     const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
@@ -1257,7 +1274,7 @@ test('F04 bare Ctrl-C followed by batch packet with multiple Enters escalates to
 });
 
 test('F04 bare Ctrl-C followed by two independent packets during barrier escalates to permanent ambiguous ownership', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-two-packets-barrier');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-two-packets-barrier');
   try {
     // 1. Bare Ctrl-C at prompt
     const ctrlC = session.write([{ type: 'key', key: 'CTRL_C' }]);
@@ -1293,7 +1310,7 @@ test('F04 bare Ctrl-C followed by two independent packets during barrier escalat
 });
 
 test('F04 same packet containing Ctrl-C and Enter sets barrier, counts episode input, and does not claim 130', { timeout: 10_000 }, async () => {
-  const { session, channel, nonce } = await scriptedSession('f04-same-packet-ctrlc');
+  const { session, channel, nonce, marker } = await scriptedSession('f04-same-packet-ctrlc');
   try {
     // Single packet contains both Ctrl-C and command with Enter
     const samePacket = session.write([
@@ -1337,7 +1354,7 @@ test('F04 same packet containing Ctrl-C and Enter sets barrier, counts episode i
 test('F04 interleaved Ctrl-C, A1, second Ctrl-C, A2 preserves submission counter across repeated Ctrl-C and protects C', { timeout: 10_000 }, async () => {
   // Use a generous observation budget (1500ms) to ensure C is actively observing
   // when late A2 arrives, proving protection comes from ambiguous ownership, not timeout.
-  const { session, channel, nonce } = await scriptedSession('f04-interleaved-ctrlc', 1500);
+  const { session, channel, nonce, marker } = await scriptedSession('f04-interleaved-ctrlc', 1500);
   try {
     // 1. First bare Ctrl-C sets interruptBarrier=true (submissions=0)
     const ctrl1 = session.write([{ type: 'key', key: 'CTRL_C' }]);

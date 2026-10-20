@@ -208,3 +208,41 @@ test('validateKeys canonicalizes a batch and fails before sending', () => {
   assert.equal(isSupportedKey('home'), true);
   assert.equal(isSupportedKey('homepage'), false);
 });
+
+test('C1 text rejects every U+0080 through U+009F before encoding input', () => {
+  for (let code = 0x80; code <= 0x9f; code++) {
+    assert.equal(
+      codeOf(() => encodeAction({ type: 'text', text: `a${String.fromCodePoint(code)}b` }, snapshot())),
+      'INVALID_TEXT',
+      `U+${code.toString(16).toUpperCase()}`,
+    );
+  }
+});
+
+test('C1 bracketed paste rejects every U+0080 through U+009F', () => {
+  const modes = snapshot({ bracketedPaste: true });
+  for (let code = 0x80; code <= 0x9f; code++) {
+    assert.equal(
+      codeOf(() => encodeAction({ type: 'paste', text: `a${String.fromCodePoint(code)}b` }, modes)),
+      'INVALID_PASTE',
+      `U+${code.toString(16).toUpperCase()}`,
+    );
+  }
+});
+
+test('C1 boundary controls retain printable text and allowed paste TAB/CR/LF', () => {
+  const text = '~\u00a0中文😀';
+  assert.equal(encodeAction({ type: 'text', text }, snapshot()), text);
+  const paste = text + '\t\r\nnext\n';
+  assert.equal(
+    encodeAction({ type: 'paste', text: paste }, snapshot({ bracketedPaste: true })),
+    '\x1b[200~' + paste + '\x1b[201~',
+  );
+});
+
+test('C1 paste retains mode-off refusal precedence instead of silently downgrading', () => {
+  assert.equal(
+    codeOf(() => encodeAction({ type: 'paste', text: '\u0085' }, snapshot())),
+    'PASTE_UNSUPPORTED',
+  );
+});

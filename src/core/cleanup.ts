@@ -1,7 +1,7 @@
 import { LiteSshError, publicError } from './errors.js';
 
 export interface CleanupFailure {
-  resource: 'terminal' | 'transfer' | 'sftp' | 'connection' | 'mcp';
+  resource: 'terminal' | 'transfer' | 'sftp' | 'connection' | 'mcp' | 'configuration';
   code: string;
   /** Only caller-selected, bounded public ownership facts; never a raw Error. */
   facts?: Record<string, unknown>;

@@ -35,7 +35,7 @@
  */
 import { LiteSshError } from '../core/errors.js';
 import type { ShellKind } from '../core/types.js';
-import { MARKER_NAMESPACE, MARKER_OSC_ID } from './protocol.js';
+import { MARKER_NAMESPACE, MARKER_OSC_ID, MAX_SHELL_SEQUENCE } from './protocol.js';
 
 /** Nonces are embedded in shell identifiers and quoted strings, so keep them tame. */
 const NONCE_PATTERN = /^[A-Za-z0-9_.-]+$/;
@@ -108,22 +108,39 @@ export function detectShell(probe: string): ShellKind {
  */
 function bashBootstrap(nonce: string, savedStty: string): string {
   const id = '__lssh_' + identifier(nonce) + '_';
-  // Concatenate our BEGIN escape with the user's PS0 so their prompt text stays.
-  const begin = "PS0=$'" + oscFormat(nonce, 'BEGIN') + "'\"${PS0-}\"";
-  // $? is captured on the first line, before our printf can clobber it.
-  const precmd =
-    id + 'precmd() { local ' + id + 'ec=$?; ' +
-    'local ' + id + 'ps0="${PS0-}"; ' +
-    'local ' + id + 'h=0; ' +
-    'if [ -n "$' + id + 'ps0" ] && [ "${' + id + 'ps0#$\'' + oscFormat(nonce, 'BEGIN') + '\'}" != "$' + id + 'ps0" ]; then ' +
-    id + 'h=1; fi; ' +
-    'if [ "${' + id + 'ready}" = "1" ]; then ' +
-    'printf "' + oscFormat(nonce, 'END;%d;%d') + '" "$' + id + 'ec" "$' + id + 'h"; ' +
-    'else ' + id + 'ready=1; printf "' + oscFormat(nonce, 'READY;bash') + '"; fi; ' +
-    'return $' + id + 'ec; }';
-  // `case` on `declare -p` output avoids depending on grep being present.
+  // PS0 is expanded by Bash outside the parent prompt hook. Install a literal
+  // number there; only the parent PROMPT_COMMAND advances the wire counter.
+  const begin = "PS0=$'" + oscFormat(nonce, 'BEGIN;1') + "'\"${PS0-}\"";
+  const ownedPrefix = oscFormat(nonce, 'BEGIN;').slice(0, -4); // Without the literal \\007 BEL.
+  const precmd = [
+    `${id}precmd() { local ${id}ec=$?`,
+    `if [ "$${id}exhausted" = 1 ]; then return "$${id}ec"; fi`,
+    `local ${id}ps0="\${PS0-}" ${id}h=0 ${id}suffix=''`,
+    `local ${id}tail="\${${id}ps0#$'${ownedPrefix}'}"`,
+    `local ${id}digits="\${${id}tail%%$'\\007'*}"`,
+    // Recognize only an anchored, positive in-range owned prefix. Removing
+    // leading zeroes for comparison does not reject valid decimal wire input.
+    `if [ "$${id}tail" != "$${id}ps0" ] && [ "$${id}tail" != "$${id}digits" ]; then ` +
+      `case "$${id}digits" in ''|*[!0-9]*) ;; *) ` +
+      `local ${id}number="\${${id}digits#"\${${id}digits%%[!0]*}"}"; ` +
+      `if [ -n "$${id}number" ] && [ "\${#${id}number}" -le 10 ] && ` +
+      `[ "$${id}number" -le ${MAX_SHELL_SEQUENCE} ]; then ${id}h=1; ` +
+      `${id}suffix="\${${id}tail#*$'\\007'}"; fi;; esac; fi`,
+    `if [ "$${id}ready" = 1 ]; then ` +
+      `printf "${oscFormat(nonce, 'END;%d;%d;%d')}" "$${id}seq" "$${id}ec" "$${id}h"; ` +
+      `if [ "$${id}seq" -eq ${MAX_SHELL_SEQUENCE} ]; then ${id}exhausted=1; ` +
+      `if [ "$${id}h" = 1 ]; then PS0="$${id}suffix"; fi; ` +
+      `printf "${oscFormat(nonce, 'UNSUPPORTED;sequence_exhausted')}"; ` +
+      `else ${id}seq=$(( ${id}seq + 1 )); ` +
+      // Normalize a restored older OWNED prefix, preserving its current user
+      // suffix. An absent/foreign hook is deliberately never reinstalled.
+      `if [ "$${id}h" = 1 ]; then printf -v PS0 "${oscFormat(nonce, 'BEGIN;%d')}%s" ` +
+      `"$${id}seq" "$${id}suffix"; fi; fi; ` +
+      `else ${id}ready=1; printf "${oscFormat(nonce, 'READY;bash')}"; fi`,
+    `return "$${id}ec"; }`,
+  ].join('; ');
   const install = joinCommands([
-    id + 'ready=0',
+    id + 'ready=0; ' + id + 'seq=1; ' + id + 'exhausted=0',
     'case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in ' +
       'declare\\ -a*) ' + id + 'pc_array=1; ' + id + 'pc_old=("${PROMPT_COMMAND[@]}");; ' +
       '*) ' + id + 'pc_array=0; ' + id + 'pc_old="${PROMPT_COMMAND-}";; esac',
@@ -167,26 +184,29 @@ function bashBootstrap(nonce: string, savedStty: string): string {
 function zshBootstrap(nonce: string, savedStty: string): string {
   const id = '__lssh_' + identifier(nonce) + '_';
   const save = 'if (( $+functions[precmd] )); then functions[' + id + 'orig_precmd]=$functions[precmd]; fi';
-  // Trivial status restorer: `return $1` lets the saved hook observe the
-  // original `$?` while running in an ERR_EXIT/ERR_RETURN-exempt condition.
   const restore = id + 'ret() { return $1; }';
-  const preexec = id + 'preexec() { printf "' + oscFormat(nonce, 'BEGIN') + '"; }';
+  const preexec = id + 'preexec() { if (( ! ' + id + 'exhausted )); then printf "' +
+    oscFormat(nonce, 'BEGIN;%d') + '" "$' + id + 'seq"; fi; }';
   const precmd =
     'precmd() { local ' + id + 'ec=$?; ' +
     'local ' + id + 'h=0; ' +
     'if (( $+functions[' + id + 'preexec] )) && (( $+preexec_functions )) && (( ${preexec_functions[(Ie)' + id + 'preexec]} )); then ' + id + 'h=1; fi; ' +
+    'if (( ! ' + id + 'exhausted )); then ' +
     'if (( ' + id + 'ready )); then ' +
-    'printf "' + oscFormat(nonce, 'END;%d;%d') + '" "$' + id + 'ec" "$' + id + 'h"; ' +
-    'else ' + id + 'ready=1; printf "' + oscFormat(nonce, 'READY;zsh') + '"; fi; ' +
+    'printf "' + oscFormat(nonce, 'END;%d;%d;%d') + '" "$' + id + 'seq" "$' + id + 'ec" "$' + id + 'h"; ' +
+    'if (( ' + id + 'seq == ' + MAX_SHELL_SEQUENCE + ' )); then ' + id + 'exhausted=1; ' +
+    'printf "' + oscFormat(nonce, 'UNSUPPORTED;sequence_exhausted') + '"; ' +
+    'else (( ' + id + 'seq += 1 )); fi; ' +
+    'else ' + id + 'ready=1; printf "' + oscFormat(nonce, 'READY;zsh') + '"; fi; fi; ' +
+    // Preserve the old status-restorer and user hook order, even at exhaustion.
     'if (( $+functions[' + id + 'orig_precmd] )); then ' +
     'if ' + id + 'ret "$' + id + 'ec"; then ' + id + 'orig_precmd; else ' + id + 'orig_precmd; fi; ' +
     'return $?; fi; ' +
     'return 0; }';
-  // Ensure the array exists (nounset-safe) before prepending, then keep order.
   const array = 'typeset -ga preexec_functions; preexec_functions=(' + id + 'preexec $preexec_functions)';
   const install = joinCommands([
     save,
-    'typeset -g ' + id + 'ready=0',
+    'typeset -g ' + id + 'ready=0 ' + id + 'seq=1 ' + id + 'exhausted=0',
     restore,
     preexec,
     precmd,
@@ -213,37 +233,44 @@ function zshBootstrap(nonce: string, savedStty: string): string {
  */
 function fishBootstrap(nonce: string, savedStty: string): string {
   const id = '__lssh_' + identifier(nonce) + '_';
-  const begin = 'printf "' + oscFormat(nonce, 'BEGIN') + '"';
-  const end = 'printf "' + oscFormat(nonce, 'END;%d;%d') + '" $' + id + 'ec $' + id + 'h';
+  const begin = 'printf "' + oscFormat(nonce, 'BEGIN;%d') + '" $' + id + 'seq';
+  // Both existing END-producing events share this one transition. Prompt-only
+  // notifications do not manufacture an additional completion after postexec.
+  const end =
+    'if test $' + id + 'exhausted -eq 0; ' +
+    'printf "' + oscFormat(nonce, 'END;%d;%d;%d') + '" $' + id + 'seq $' + id + 'ec $' + id + 'h; ' +
+    'if test $' + id + 'seq -eq ' + MAX_SHELL_SEQUENCE + '; set -g ' + id + 'exhausted 1; ' +
+    'printf "' + oscFormat(nonce, 'UNSUPPORTED;sequence_exhausted') + '"; ' +
+    'else; set -g ' + id + 'seq (math $' + id + 'seq + 1); end; end';
   const readyPrint = 'printf "' + oscFormat(nonce, 'READY;fish') + '"';
   const preexec =
-    'function ' + id + 'preexec --on-event fish_preexec; ' + begin + '; ' +
-    'set -g ' + id + 'round 1; end';
+    'function ' + id + 'preexec --on-event fish_preexec; ' +
+    'if test $' + id + 'exhausted -eq 0; ' + begin + '; ' +
+    'set -g ' + id + 'round 1; end; end';
+  const health =
+    'set -l ' + id + 'h 0; ' +
+    'if functions -q ' + id + 'preexec; and string match -q -r \'^function[[:space:]]+.*--on-event[[:space:]]+fish_preexec\' (functions ' + id + 'preexec 2>/dev/null); set ' + id + 'h 1; end; ';
   const postexec =
     'function ' + id + 'postexec --on-event fish_postexec; ' +
-    'set -l ' + id + 'ec $status; ' +
-    'set -l ' + id + 'h 0; ' +
-    'if functions -q ' + id + 'preexec; and string match -q -r \'^function[[:space:]]+.*--on-event[[:space:]]+fish_preexec\' (functions ' + id + 'preexec 2>/dev/null); set ' + id + 'h 1; end; ' +
+    'set -l ' + id + 'ec $status; ' + health +
     'if test $' + id + 'ready -eq 0; set -g ' + id + 'ready 1; set -g ' + id + 'round 0; ' +
     readyPrint + '; else; ' +
     'if test $' + id + 'round -eq 1; ' + end + '; set -g ' + id + 'round 0; end; ' +
     'end; end';
   const posterror =
     'function ' + id + 'posterror --on-event fish_posterror; ' +
-    'set -l ' + id + 'ec $status; ' +
-    'set -l ' + id + 'h 0; ' +
-    'if functions -q ' + id + 'preexec; and string match -q -r \'^function[[:space:]]+.*--on-event[[:space:]]+fish_preexec\' (functions ' + id + 'preexec 2>/dev/null); set ' + id + 'h 1; end; ' +
+    'set -l ' + id + 'ec $status; ' + health +
     'if test $' + id + 'ready -eq 0; set -g ' + id + 'ready 1; set -g ' + id + 'round 0; ' +
     readyPrint + '; else; ' +
-    // No BEGIN: parser-rejected input never ran, so there is no real round start.
-    end + '; set -g ' + id + 'round 0; ' +
-    'end; end';
+    end + '; set -g ' + id + 'round 0; end; end';
   const prompt =
     'function ' + id + 'prompt --on-event fish_prompt; ' +
     'if test $' + id + 'ready -eq 0; set -g ' + id + 'ready 1; ' + readyPrint + '; end; end';
   const install = joinCommands([
     'set -g ' + id + 'ready 0',
     'set -g ' + id + 'round 0',
+    'set -g ' + id + 'seq 1',
+    'set -g ' + id + 'exhausted 0',
     preexec,
     postexec,
     posterror,

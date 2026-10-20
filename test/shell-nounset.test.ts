@@ -10,7 +10,7 @@ const nonce = 'p2_nounset';
 test('F11 BEGIN installation treats an unset PS0 as empty without losing existing text', () => {
   const script = makeShellBootstrap('bash', nonce, '');
   assert.ok(script.includes(
-    "PS0=$'\\033]777;LSSH;" + nonce + ";BEGIN\\007'\"${PS0-}\""
+    "PS0=$'\\033]777;LSSH;" + nonce + ";BEGIN;1\\007'\"${PS0-}\""
   ));
 });
 

@@ -33,6 +33,17 @@ export const MARKER_NAMESPACE = 'LSSH';
  * Rejected payloads are still consumed by the caller so they never leak to the
  * screen; only well-formed, nonce-matching events reach `onMarker`.
  */
+/** Shared wire range: positive decimal rounds, never an implicit wrap. */
+export const MAX_SHELL_SEQUENCE = 2_147_483_647;
+
+function parseSequence(raw: string | undefined): number | null {
+  if (raw === undefined || !/^[0-9]+$/.test(raw)) return null;
+  const sequence = Number(raw);
+  return Number.isInteger(sequence) && sequence >= 1 && sequence <= MAX_SHELL_SEQUENCE
+    ? sequence
+    : null;
+}
+
 export function parseMarker(data: string, nonce: string): ShellMarker | null {
   const parts = data.split(';');
   if (parts[0] !== MARKER_NAMESPACE) return null;
@@ -55,21 +66,23 @@ export function parseMarker(data: string, nonce: string): ShellMarker | null {
       if (shell !== 'bash' && shell !== 'zsh' && shell !== 'fish') return null;
       return { nonce, kind: 'ready', shell };
     }
-    case 'BEGIN':
-      return { nonce, kind: 'begin' };
+    case 'BEGIN': {
+      if (parts.length !== 4) return null;
+      const sequence = parseSequence(parts[3]);
+      if (sequence === null) return null;
+      return { nonce, kind: 'begin', sequence };
+    }
     case 'END': {
-      const raw = parts[3];
+      if (parts.length !== 6) return null;
+      const sequence = parseSequence(parts[3]);
+      if (sequence === null || (parts[5] !== '0' && parts[5] !== '1')) return null;
+      const raw = parts[4];
       if (raw === undefined || raw === '') return null;
       const exitCode = Number(raw);
       if (!Number.isInteger(exitCode) || exitCode < 0) return null;
-      // The optional health field is emitted by the new bootstrap. Keep the
-      // legacy marker shape unchanged; Session supplies its legacy default.
-      return {
-        nonce,
-        kind: 'end',
-        exitCode,
-        ...(parts[4] !== undefined ? { hookHealthy: parts[4] === '1' } : {}),
-      };
+      // Retain the existing non-negative integral status semantics; sequence
+      // validation must not introduce an unrelated 0..255 exit-status cap.
+      return { nonce, kind: 'end', sequence, exitCode, hookHealthy: parts[5] === '1' };
     }
     case 'UNSUPPORTED': {
       // Reason is free text after the event keyword; empty is still valid.

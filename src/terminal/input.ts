@@ -162,7 +162,7 @@ export function encodeBatch(
 function encodeText(text: string): string {
   for (const character of text) {
     const code = character.codePointAt(0) ?? 0;
-    if (code < 0x20 || code === 0x7f) {
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
       throw new LiteSshError(
         'INVALID_TEXT',
         'Text actions accept literal printable characters only; use a key action for control input.',
@@ -183,7 +183,7 @@ function encodePaste(text: string, snapshot: ScreenSnapshot): string {
   }
   for (const character of text) {
     const code = character.codePointAt(0) ?? 0;
-    const isControl = code < 0x20 || code === 0x7f;
+    const isControl = code < 0x20 || (code >= 0x7f && code <= 0x9f);
     if (isControl && !PASTE_ALLOWED_CONTROLS.has(character)) {
       // An embedded ESC[201~ would end the wrapper early; other controls would
       // be performed instead of pasted literally.

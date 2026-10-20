@@ -2,6 +2,7 @@ import { generateKeyPairSync, createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import ssh2 from 'ssh2';
 import { attachMockSftp, emptySftpStats, type MockSftpOptions } from './mock-sftp.js';
+import { createShellMarkers } from './shell-markers.js';
 
 /** Real SSH protocol, simulated shell. Host keys stay in memory; never use ~/.ssh. */
 export async function startMockSsh(options: {
@@ -54,11 +55,13 @@ export async function startMockSsh(options: {
           let nonce = '';
           let hidden = false;
           let tui = false;
+          let markers = createShellMarkers('', 1);
           const marker = (event: string, value = '') => channel.write(`\x1b]777;LSSH;${nonce};${event}${value ? `;${value}` : ''}\x07`);
-          const end = (code = 0) => { marker('END', String(code)); channel.write('fixture$ '); };
+          const end = (code = 0) => { channel.write(markers.end(code, true)); channel.write('fixture$ '); };
           const line = (command: string): void => {
             if (command.includes('/proc/$PPID/comm')) {
               nonce = /LSSH;([A-Za-z0-9_.-]+);/.exec(command)?.[1] ?? '';
+              markers = createShellMarkers(nonce, 1);
               marker('STTY', '0:0:0:0'); marker('PROBE', 'bash'); return;
             }
             if (command.includes('READY;bash')) { marker('READY', 'bash'); channel.write('fixture$ '); return; }
@@ -66,7 +69,7 @@ export async function startMockSsh(options: {
             if (tui) { if (command === ':q') { tui = false; channel.write('\x1b[?2004l\x1b[?1049l'); end(); } return; }
             channel.write(`${command}\r\n`); // Echo is visible; input is not mirrored by the recorder.
             if (command === 'syntax error') { channel.write('bash: syntax error\r\n'); end(2); return; }
-            marker('BEGIN');
+            channel.write(markers.begin());
             if (command === 'emit small') { channel.write('short readable output\r\n'); end(); }
             else if (command === 'emit large') { channel.write('界'.repeat(1200) + '\r\n'); end(); }
             else if (command === 'emit unbroken') { channel.write('x'.repeat(1201)); end(); }

@@ -6,6 +6,7 @@ import { LiteSshError } from '../core/errors.js';
 import { SerialQueue, deferred, withTimeout } from '../core/async.js';
 import type { ConnectionLease, InputAction, RoundResult, ScreenSnapshot, ShellMarker, TerminalIdentity, TerminalStatus } from '../core/types.js';
 import { ScreenModel } from './screen.js';
+import { MAX_SHELL_SEQUENCE } from '../shell/protocol.js';
 import { encodeBatch } from './input.js';
 import { detectShell, makeShellBootstrap, makeShellProbe } from '../shell/integration.js';
 import { connectionCleanupFailure, terminalCleanupFailure, withTerminalCleanup } from './cleanup.js';
@@ -81,6 +82,10 @@ export class TerminalSession {
   private readonly initializationTimeout: number;
   private readonly writeWait: number;
   private eventSequence = 0;
+  /** Remote wire rounds are not cache rounds, Enter credits or local change events. */
+  private runtimeReady = false;
+  private nextWireSequence = 1;
+  private activeWireSequence?: number;
   private failure?: LiteSshError;
   /** Receive-side health is separate: remote EOF must not discard accepted bytes. */
   private recordingFailure?: LiteSshError;
@@ -291,15 +296,60 @@ export class TerminalSession {
   private notify(): void { this.eventSequence++; this.events.emit('change'); }
 
   private onMarker(marker: ShellMarker): void {
-    this.markers.set(marker.kind, marker);
-    if (marker.kind === 'unsupported') {
-      this.fail(new LiteSshError('SHELL_INTEGRATION_UNSUPPORTED', marker.reason), 'SHELL_INTEGRATION_UNSUPPORTED');
-    } else if (this.initialized && marker.kind === 'begin') {
-      this.onTrustedBegin();
-    } else if (this.initialized && marker.kind === 'end') {
-      this.onTrustedEnd(marker.exitCode, marker.hookHealthy);
+    if (marker.kind === 'begin' || marker.kind === 'end') {
+      if (!this.runtimeReady) return;
+      // Validate BEFORE changing ownership, cache cycles or hook-loss trust.
+      // A malformed/foreign frame never reaches here; a valid but inconsistent
+      // owned frame fails closed and cannot be repaired by a later READY/END.
+      if (!this.acceptWireMarker(marker)) {
+        this.runtimeReady = false;
+        this.fail(new LiteSshError(
+          'SHELL_INTEGRATION_LOST',
+          'Shell marker sequence was inconsistent. Close this terminal and open a new one; input was not replayed.',
+        ), 'SHELL_INTEGRATION_LOST');
+        return;
+      }
+      this.markers.set(marker.kind, marker);
+      if (marker.kind === 'begin') this.onTrustedBegin();
+      else {
+        this.onTrustedEnd(marker.exitCode, marker.hookHealthy);
+        if (marker.sequence === MAX_SHELL_SEQUENCE) {
+          // onTrustedEnd queues the final factual result first. Never wrap to
+          // zero or let a future command reuse this already-completed round.
+          this.runtimeReady = false;
+          this.fail(new LiteSshError(
+            'SHELL_INTEGRATION_UNSUPPORTED',
+            'Shell marker sequence was exhausted. Close this terminal and open a new one.',
+          ), 'SHELL_INTEGRATION_UNSUPPORTED');
+        }
+      }
+      if (this.failure?.code === 'SHELL_INTEGRATION_LOST') this.runtimeReady = false;
+    } else {
+      if (marker.kind === 'ready' && !this.initialized && !this.markers.has('ready') && !this.failure) {
+        // READY and a runtime tail can be parsed in the SAME xterm write. The
+        // async open() continuation has not set initialized yet at this point.
+        this.runtimeReady = true;
+      }
+      this.markers.set(marker.kind, marker);
+      if (marker.kind === 'unsupported' && !this.failure) {
+        this.runtimeReady = false;
+        this.fail(new LiteSshError('SHELL_INTEGRATION_UNSUPPORTED', marker.reason), 'SHELL_INTEGRATION_UNSUPPORTED');
+      }
     }
     this.notify();
+  }
+
+  /** Accept one wire transition; an END-only round is a real shell event too. */
+  private acceptWireMarker(marker: Extract<ShellMarker, { kind: 'begin' | 'end' }>): boolean {
+    if (marker.kind === 'begin') {
+      if (this.activeWireSequence !== undefined || marker.sequence !== this.nextWireSequence) return false;
+      this.activeWireSequence = marker.sequence;
+      return true;
+    }
+    if (marker.sequence !== (this.activeWireSequence ?? this.nextWireSequence)) return false;
+    this.activeWireSequence = undefined;
+    if (marker.sequence < MAX_SHELL_SEQUENCE) this.nextWireSequence = marker.sequence + 1;
+    return true;
   }
 
   /** Open a fresh, private candidate round with no publication or execution claim. */
@@ -552,7 +602,8 @@ export class TerminalSession {
   }
 
   private checkInputBudget(data: string): void {
-    if (this.status === 'closing' || this.status === 'closed' || !this.channel?.writable || this.channel.destroyed) {
+    if (this.status === 'closing' || this.status === 'closed' || !this.channel?.writable ||
+        this.channel.destroyed || this.channel.errored) {
       throw new LiteSshError('TERMINAL_CLOSED', 'The PTY is not writable.');
     }
     // Native Writable length includes the currently retained ssh2 callback and
@@ -562,10 +613,15 @@ export class TerminalSession {
     }
   }
 
-  private enqueueInput(data: string): void {
+  private enqueueInput(data: string, onAttempt?: () => void, onAccepted?: () => void): void {
     this.checkInputBudget(data);
+    // Also cover internal protocol replies: byte credit cannot bound empty
+    // Writable callback entries retained behind an earlier native write.
+    if (data.length === 0) return;
     let returned = false;
     let synchronousFailure: LiteSshError | undefined;
+    // An invoked native call can have a prefix effect even when it throws.
+    onAttempt?.();
     this.channel!.write(data, (error?: Error | null) => {
       if (!error) return;
       const failure = new LiteSshError('TERMINAL_WRITE_FAILED', 'Input transmission failed; it has not been replayed.');
@@ -574,13 +630,14 @@ export class TerminalSession {
     });
     returned = true;
     if (synchronousFailure) throw synchronousFailure;
+    onAccepted?.(); // A healthy write(false) still queued the complete packet.
   }
 
-  private async send(data: string): Promise<void> {
+  private async send(data: string, onAttempt?: () => void, onAccepted?: () => void): Promise<void> {
     // Accepted by the native FIFO is the handoff, NOT a remote processing ACK.
     // ssh2 can retain its callback forever under window backpressure. Waiting
     // for it here would block both the observation deadline and owned close.
-    this.enqueueInput(data);
+    this.enqueueInput(data, onAttempt, onAccepted);
   }
 
   private current(): Record<string, unknown> {
@@ -635,6 +692,41 @@ export class TerminalSession {
   }
 
   async write(actions: InputAction[], signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const requested = actions.length;
+    let accepted: number | null = 0;
+    const facts = () => ({
+      inputActionsRequested: requested,
+      inputActionsAccepted: accepted,
+      inputSent: accepted === null ? null : accepted > 0,
+    });
+    try {
+      const result = await this.writeTracked(actions, signal, value => { accepted = value; });
+      // Apply local facts LAST: an error's public details must not roll N back
+      // to zero, or turn an invoked-but-unknown native effect into inputSent:false.
+      return { ...result, ...facts() };
+    } catch (error) {
+      const failure = error instanceof LiteSshError
+        ? error
+        : accepted === null && this.failure
+          ? this.failure
+          : new LiteSshError('INTERNAL_ERROR', 'The operation failed; no input has been automatically replayed.');
+      if (failure.code === 'CACHE_WRITE_FAILED') this.failRecording(failure);
+      throw new LiteSshError(failure.code, failure.message, {
+        ...failure.details,
+        ...(this.recordingFailure ? {
+          recordingErrorCode: this.recordingFailure.code,
+          cacheMayBeIncomplete: true,
+        } : {}),
+        ...facts(),
+      });
+    }
+  }
+
+  private async writeTracked(
+    actions: InputAction[],
+    signal: AbortSignal | undefined,
+    onHandoff: (accepted: number | null) => void,
+  ): Promise<Record<string, unknown>> {
     if (signal?.aborted) throw new LiteSshError('REQUEST_CANCELLED', 'Observation cancelled before input handoff.', { inputSent: false });
     if (!actions.length || actions.length > 64) throw new LiteSshError('INVALID_ACTIONS', 'Provide 1 through 64 input actions.');
     if (this.activeWrites >= 64) throw new LiteSshError('RESOURCE_LIMIT', 'The PTY has reached its 64 active-input-observer budget.');
@@ -648,6 +740,7 @@ export class TerminalSession {
     let initialRevision = this.screen.snapshot().revision;
     let initialSequence = this.eventSequence;
     let sent = false;
+    let noOp = false;
     let baseline = this.eventSequence;
     /** This write's submission token; undefined for non-submitting input. */
     let token: number | undefined;
@@ -705,6 +798,13 @@ export class TerminalSession {
         // authoritative encode happens after the flush, against the screen as
         // it is at the actual handoff.
         const preliminary = encodeBatch(actions, this.screen.snapshot());
+        if (preliminary.packet.length === 0) {
+          // Keep validation/writable-state precedence, but empty literal text
+          // creates no native callback, STEP, owner or remote observation.
+          this.checkInputBudget(preliminary.packet);
+          noOp = true;
+          return;
+        }
         // Give the submitted line a home inside a PRIVATE candidate before the
         // flush, then persist everything enqueued so far. A shell END observed
         // while this flush is pending belongs to earlier input and can only
@@ -725,20 +825,34 @@ export class TerminalSession {
         observeScreenChange = this.activeRound() !== undefined || submissions === 0;
         ambiguousBatch = submissions > 1;
         token = this.handoff(submissions, packet);
-        this.recorder.recordStep(actions);
+        const step = this.recorder.recordStep(actions);
+        let accepted: number | null = 0;
+        const mark = (value: number | null): void => {
+          accepted = value;
+          onHandoff(value);
+        };
         // Events observed while waiting for the send queue are not post-input observations.
         initialRevision = this.screen.snapshot().revision;
         baseline = this.eventSequence;
         initialSequence = this.eventSequence;
         try {
-          await this.send(packet);
+          // Queue admission is synchronous, not the retained ssh2 callback.
+          // Record the final local outcome below before yielding to observation.
+          this.enqueueInput(packet, () => mark(null), () => mark(actions.length));
         } catch (error) {
           this.fail(error, 'TERMINAL_WRITE_FAILED');
           throw error;
+        } finally {
+          // One outcome row belongs to the SAME STEP. Append failure is a
+          // recording diagnostic, never a rollback of local queue admission
+          // and never a replacement for an earlier transmission failure.
+          try { this.recorder.recordStepOutcome(step, actions.length, accepted); }
+          catch (error) { this.failRecording(error); }
         }
         sent = true;
         listener?.();
       });
+      if (noOp) return this.current();
       const reason = await observation;
       if (reason === 'cancelled') {
         const view = this.current();
