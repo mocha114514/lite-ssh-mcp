@@ -10,33 +10,36 @@ The AI calls the tools. You connect the server to your client, configure SSH log
 
 Requires **Node.js 22+** and an AI client that can launch local MCP servers over stdio. Local use currently focuses on Windows; compatibility with other local platforms is not guaranteed.
 
-After obtaining the source, run these commands in the project directory:
-
-```sh
-npm ci --ignore-scripts
-npm run build
-```
-
 Add the server to your MCP client, adapting the configuration format to your client:
 
 ```json
 {
   "mcpServers": {
     "lite-ssh": {
-      "command": "node",
-      "args": ["D:/path/to/lite-ssh-mcp/dist/cli.js"]
+      "command": "npx",
+      "args": [
+        "-y",
+        "lite-ssh-mcp@0.1.0"
+      ]
     }
   }
 }
 ```
 
-Replace the example path with the absolute path to your local `dist/cli.js`. If the client cannot find `node`, set `command` to the full path of the Node.js executable.
+`npx` downloads and runs the npm package; no source checkout or global installation is required. If the client cannot find `npx`, make sure it can access your Node.js installation, or use the full path to `npx`.
 
-Save the configuration, then start or reconnect the server in your client. After updating the source, rebuild and reconnect.
+### Run from source
+
+For local development, obtain the source and run these commands in the project directory:
+
+```sh
+npm ci --ignore-scripts
+npm run build
+```
+
+In the client configuration above, change `command` to `node` and `args` to `["D:/path/to/lite-ssh-mcp/dist/cli.js"]`. Replace the example path with the absolute path to your local build.
 
 ## Configure SSH logins
-
-The remote host needs SSH, and file transfers also require SFTP. Interactive terminals use Bash, Zsh or Fish.
 
 On first startup, the server creates these files in `.lite-ssh` under the current user's home directory:
 
@@ -49,8 +52,8 @@ Existing files are not overwritten. Edit **`config.json`** with your server's IP
 {
   "version": 2,
   "servers": {
-    "192.0.2.10": {
-      "22": {
+    "<your-ip>": {
+      "<your-port>": {
         "accounts": {
           "deploy": {
             "auth": {
@@ -77,25 +80,7 @@ Replace the example IP, port, account and password. For private-key authenticati
 
 Omit `passphrase` if the private key is not encrypted.
 
-On the first connection or after a server host-key change, check the fingerprint reported by the AI with the server administrator or another trusted source before explicitly confirming it. Do not skip fingerprint verification.
-
-## Use
-
-Once connected, describe what you want the AI to do, for example:
-
-- “Connect to 192.0.2.10 and check disk usage.”
-- “Start a build on the server and monitor its output.”
-- “Upload this local directory to `/srv/project` without overwriting existing files.”
-- “Download the server logs to the local directory I specify.”
-
-You do not need to fill in tool arguments or call the interfaces manually.
-
-## Important notes
-
-- Keep connection configuration and private keys local. Do not commit them to Git or share them. If the server reports unsafe file permissions, adjust them yourself; it does not automatically change permissions on existing files.
-- Transfers do not overwrite existing content or follow symbolic links by default. Explicitly authorize the AI when either is needed.
-- Terminal output is stored in temporary local logs and may contain sensitive information. Save any output you need to retain before closing the terminal.
-- Closing a terminal does not guarantee that remote background tasks stop. Cancelling a transfer does not roll back files already transferred.
+On the first connection or after a server host-key change, you will be prompted to verify the server's identity.
 
 ## License
 

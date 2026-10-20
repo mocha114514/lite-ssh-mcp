@@ -9,7 +9,7 @@ import { TerminalService } from '../terminal/service.js';
 import { TransferManager } from '../sftp/manager.js';
 import type { InputAction } from '../core/types.js';
 
-export const VERSION = '0.1.0-m0.1';
+export const VERSION = '0.1.0';
 const ip = z.string().refine(value => isIP(value) !== 0, 'Use a literal IPv4/IPv6 address.').describe('Configured service IP address.');
 const port = z.number().int().min(1).max(65535).describe('Configured SSH port.');
 const username = z.string().min(1).max(256).refine(value => !value.includes('\0')).describe('Actual configured SSH username, not a terminal nickname.');
