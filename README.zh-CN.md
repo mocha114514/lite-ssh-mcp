@@ -6,6 +6,24 @@
 
 AI 负责调用工具；你只需要接入服务、配置 SSH 连接，再用自然语言描述任务。终端与文件传输相互独立，不需要为传输先打开终端。
 
+## 工具一览
+
+| 工具 | 用途 |
+|---|---|
+| `lite_ssh_list_configurations` | 列出已配置的服务器、端口和登录账号。 |
+| `lite_ssh_confirm_host_key` | 确认并保存已观察到的服务器主机指纹。 |
+| `lite_ssh_terminal_open` | 使用指定账号打开一个命名 SSH 终端。 |
+| `lite_ssh_terminal_list` | 列出当前终端及其状态。 |
+| `lite_ssh_terminal_write` | 向终端输入文本、粘贴内容或发送按键。 |
+| `lite_ssh_terminal_read` | 读取终端当前屏幕、光标和状态。 |
+| `lite_ssh_terminal_resize` | 调整终端行数和列数。 |
+| `lite_ssh_terminal_close` | 关闭指定终端并清理其缓存。 |
+| `lite_ssh_upload` | 提交文件或目录的上传任务。 |
+| `lite_ssh_download` | 提交文件或目录的下载任务。 |
+| `lite_ssh_transfer_list` | 列出传输任务及其状态。 |
+| `lite_ssh_transfer_status` | 查询指定传输任务的进度和结果。 |
+| `lite_ssh_transfer_cancel` | 请求取消指定传输任务。 |
+
 ## 安装与接入
 
 需要 **Node.js 22+**，以及能够启动本地 MCP（stdio）服务的 AI 客户端。当前主要面向 Windows 本地使用，其他本地平台暂不作兼容性保证。
@@ -25,8 +43,6 @@ AI 负责调用工具；你只需要接入服务、配置 SSH 连接，再用自
   }
 }
 ```
-
-`npx` 会下载并运行 npm 包，不需要获取源码或全局安装。如果客户端找不到 `npx`，请确认它能够访问 Node.js 的安装路径，或将 `command` 改为 `npx` 的完整路径。
 
 ### 从源码运行
 

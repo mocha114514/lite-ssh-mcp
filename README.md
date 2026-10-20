@@ -6,6 +6,24 @@ A local MCP server that lets an AI operate remote terminals over SSH and upload 
 
 The AI calls the tools. You connect the server to your client, configure SSH logins, and describe your tasks in natural language. Terminals and file transfers are independent; transfers do not require an open terminal.
 
+## Available tools
+
+| Tool | Purpose |
+|---|---|
+| `lite_ssh_list_configurations` | List configured servers, ports and login accounts. |
+| `lite_ssh_confirm_host_key` | Confirm and save an observed server host-key fingerprint. |
+| `lite_ssh_terminal_open` | Open a named SSH terminal with the specified account. |
+| `lite_ssh_terminal_list` | List current terminals and their states. |
+| `lite_ssh_terminal_write` | Type text, paste content or send keys to a terminal. |
+| `lite_ssh_terminal_read` | Read the current terminal screen, cursor and state. |
+| `lite_ssh_terminal_resize` | Adjust terminal rows and columns. |
+| `lite_ssh_terminal_close` | Close a terminal and clean up its cache. |
+| `lite_ssh_upload` | Submit a file or directory upload. |
+| `lite_ssh_download` | Submit a file or directory download. |
+| `lite_ssh_transfer_list` | List transfers and their states. |
+| `lite_ssh_transfer_status` | Query a transfer's progress and results. |
+| `lite_ssh_transfer_cancel` | Request cancellation of a transfer. |
+
 ## Install and connect
 
 Requires **Node.js 22+** and an AI client that can launch local MCP servers over stdio. Local use currently focuses on Windows; compatibility with other local platforms is not guaranteed.
@@ -25,8 +43,6 @@ Add the server to your MCP client, adapting the configuration format to your cli
   }
 }
 ```
-
-`npx` downloads and runs the npm package; no source checkout or global installation is required. If the client cannot find `npx`, make sure it can access your Node.js installation, or use the full path to `npx`.
 
 ### Run from source
 
