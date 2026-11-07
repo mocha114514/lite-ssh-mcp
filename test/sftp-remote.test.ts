@@ -75,11 +75,50 @@ test('a disposal deadline returns unconfirmed and never synthesizes closed state
   const channel = new Channel();
   channel.closeOnEnd = false;
   const fs = remote(channel);
+  let physicallyClosed = false;
+  void fs.whenClosed.then(() => { physicallyClosed = true; });
   assert.equal(await fs.dispose(), false);
   assert.equal(await fs.dispose(), false);
+  assert.equal(physicallyClosed, false);
   assert.equal(channel.ended, 1);
   channel.emit('close');
+  await fs.whenClosed;
+  assert.equal(physicallyClosed, true);
   assert.equal(await fs.dispose(), true);
+});
+
+test('parent close confirms an already pending SFTP disposal without waiting for its deadline', async () => {
+  const channel = new Channel();
+  channel.closeOnEnd = false;
+  const parent = new EventEmitter();
+  const fs = new RemoteFileSystem(channel as unknown as SFTPWrapper, 25, 25, parent as unknown as Client);
+  const closing = fs.dispose();
+  parent.emit('close');
+  assert.equal(await closing, true);
+  assert.equal(channel.ended, 1);
+});
+
+test('one parent-close listener retires all owned SFTP channels without ending the shared client', async () => {
+  const channels: Channel[] = [];
+  const client = Object.assign(new EventEmitter(), {
+    sftp(callback: (error: Error | undefined, channel: SFTPWrapper) => void) {
+      const channel = new Channel();
+      channels.push(channel);
+      callback(undefined, channel as unknown as SFTPWrapper);
+    },
+  });
+  const owners: RemoteFileSystem[] = [];
+  try {
+    for (let index = 0; index < 20; index++) {
+      owners.push(await RemoteFileSystem.open(client as unknown as Client));
+    }
+    assert.equal(client.listenerCount('close'), 1);
+    client.emit('close');
+    await Promise.all(owners.map(owner => owner.whenClosed));
+    assert.deepEqual(await Promise.all(owners.map(owner => owner.dispose())), Array(20).fill(true));
+    assert.ok(channels.every(channel => channel.ended === 0));
+    assert.equal(client.listenerCount('close'), 0);
+  } finally { await Promise.all(owners.map(owner => owner.dispose())); }
 });
 
 test('lost exclusive OPEN reports attempted temporary name without guessing ownership or replaying', async () => {

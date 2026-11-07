@@ -4,6 +4,7 @@ import type { Client, SFTPWrapper, Stats } from 'ssh2';
 import { LiteSshError } from '../core/errors.js';
 import { checkCancelled, type Metadata, type ReadHandle, type TransferFileSystem, type WriteHandle } from './filesystem.js';
 import { TRANSFER_LIMITS } from './types.js';
+import { observeConnectionClose } from './connectionClose.js';
 
 export function normalizeRemotePath(value: string): string {
   if (!value.startsWith('/') || value.includes('\0') || value.length > 32_768) {
@@ -35,6 +36,10 @@ export class RemoteFileSystem implements TransferFileSystem {
   readonly paths = path.posix;
   readonly platform = 'posix' as const;
   private closed = false;
+  private confirmClosed!: () => void;
+  /** Physical channel/parent close witness; a disposal deadline never resolves it. */
+  readonly whenClosed = new Promise<void>(resolve => { this.confirmClosed = resolve; });
+  private stopObservingConnection?: () => void;
   private unusable = false;
   private closing?: Promise<boolean>;
   private readonly checkedCommit = new Set<boolean>();
@@ -45,16 +50,26 @@ export class RemoteFileSystem implements TransferFileSystem {
     for (const reject of [...this.pending]) reject(error);
   }
   private readonly onClose = (): void => {
-    this.closed = true; // Only the actual close event proves channel teardown.
+    if (this.closed) return;
+    this.closed = true; // Actual channel or parent transport close proves teardown.
+    this.stopObservingConnection?.();
+    this.stopObservingConnection = undefined;
+    this.confirmClosed();
     this.failPending(new LiteSshError('CONNECTION_LOST', 'The owned SFTP channel closed.'));
   };
   private readonly onError = (): void => {
     this.failPending(new LiteSshError('SFTP_CHANNEL_ERROR', 'The owned SFTP channel failed; closure is not yet confirmed.'));
   };
 
-  constructor(private readonly channel: SFTPWrapper, private readonly timeoutMs = 15_000, private readonly closeTimeoutMs = 2000) {
+  constructor(
+    private readonly channel: SFTPWrapper,
+    private readonly timeoutMs = 15_000,
+    private readonly closeTimeoutMs = 2000,
+    parent?: Client,
+  ) {
     channel.on('close', this.onClose);
     channel.on('error', this.onError);
+    if (parent) this.stopObservingConnection = observeConnectionClose(parent, this.onClose);
   }
   static async open(client: Client, options?: RemoteOpenOptions): Promise<RemoteFileSystem> {
     const timeoutMs = options?.timeoutMs ?? 15_000;
@@ -154,7 +169,7 @@ export class RemoteFileSystem implements TransferFileSystem {
             // Take channel ownership before returning to ssh2. A close/error
             // may follow this callback synchronously, before any awaiting
             // caller resumes; resolving the raw channel would lose that event.
-            const remote = new RemoteFileSystem(chan);
+            const remote = new RemoteFileSystem(chan, undefined, undefined, client);
             client.removeListener('close', onClientClose);
             resolve(remote);
           }
@@ -327,7 +342,6 @@ export class RemoteFileSystem implements TransferFileSystem {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        this.channel.removeListener('close', done);
         resolve(confirmed);
       };
       const done = (): void => finish(true);
@@ -335,7 +349,7 @@ export class RemoteFileSystem implements TransferFileSystem {
         this.failPending(new LiteSshError('SFTP_CLOSE_TIMEOUT', 'SFTP channel closure was not confirmed.'));
         finish(false); // Never synthesize an onClose event.
       }, this.closeTimeoutMs);
-      this.channel.once('close', done);
+      void this.whenClosed.then(done);
       this.failPending(new LiteSshError('CONNECTION_LOST', 'The owned SFTP channel is being closed.'));
       try { this.channel.end(); } catch { finish(false); }
     });

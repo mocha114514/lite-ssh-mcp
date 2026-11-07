@@ -13,6 +13,9 @@ import { isTerminalPhase, policiesOf, TRANSFER_LIMITS, type TransferDirection, t
 
 export interface OwnedRemoteFileSystem extends TransferFileSystem {
   readonly effectUnknown?: boolean;
+  /** Resolves only on actual channel/parent close. Without a witness, unknown
+   * disposal must retain capacity rather than infer that teardown finished. */
+  readonly whenClosed?: Promise<void>;
   dispose(): Promise<boolean>;
 }
 export interface TransferManagerOptions {
@@ -53,6 +56,7 @@ interface Task {
   completion: Promise<void>;
   resolveCompletion(): void;
   channelClosed?: boolean;
+  admissionReleased?: boolean;
 }
 
 /** Application-owned task registry, independent of PTYs and client task protocols. */
@@ -67,6 +71,7 @@ export class TransferManager {
   private admitted = 0;
   private executing = 0;
   private stopping = false;
+  private shutdownFinalized = false;
   private pumpTimer?: NodeJS.Immediate;
   private expiryTimer?: NodeJS.Timeout;
   private closing?: Promise<void>;
@@ -154,9 +159,11 @@ export class TransferManager {
     } finally {
       if (!registered) {
         const cleanup = new CleanupFailures();
+        let channelClosed = remote === undefined;
         if (remote) {
           await cleanup.attempt('sftp', async () => {
-            if (await remote!.dispose() !== true) {
+            channelClosed = await remote!.dispose();
+            if (channelClosed !== true) {
               throw new LiteSshError('SFTP_CLEANUP_FAILED', 'The owned SFTP channel has not confirmed closure.');
             }
           }, 'SFTP_CLEANUP_FAILED');
@@ -172,6 +179,10 @@ export class TransferManager {
           }).catch(() => {
             // Rejection/unknown is not physical-close confirmation.
           });
+        } else if (remote && !channelClosed) {
+          // Open succeeded but a later admission step failed. The channel still
+          // owns this reservation until its physical-close witness settles.
+          void remote.whenClosed?.then(releaseFailedAdmission).catch(() => {});
         } else {
           releaseFailedAdmission();
         }
@@ -256,19 +267,40 @@ export class TransferManager {
           terminalPhase = task.progress.filesCommitted || task.progress.directoriesCreated ? 'partial_failed' : 'failed';
           task.error ??= { code: 'CONNECTION_CLEANUP_FAILED', message: 'The owned connection lease could not be released.', details: {} };
         }
-        this.admitted--;
         // Confirmed scheduling/channel stop is terminal even when a changed
         // temporary must be left for manual recovery. Cleanup uncertainty is
         // not an excuse to retain a stopped task in cancelling forever.
         if (terminalPhase === 'cancelling' && task.channelClosed === true) terminalPhase = 'cancelled';
         task.phase = terminalPhase;
         task.endedAt = this.now();
-        task.expiresAt = task.endedAt + this.limits.retentionMs;
+        if (task.channelClosed) this.retireChannel(task);
+        else {
+          // A timed-out close is a failed result, not a free channel slot. Keep
+          // its task/plan charged and unexpired until actual close is observed.
+          void task.remote.whenClosed?.then(() => {
+            task.channelClosed = true;
+            this.retireChannel(task);
+          }).catch(() => {});
+        }
         task.resolveCompletion();
-        this.armExpiry();
       }
     })();
     return task.finishing;
+  }
+
+  /** Release once, only after the finalizer and physical close both finish.
+   * Historical failure/cleanup facts are not rewritten as success by a late close. */
+  private retireChannel(task: Task): void {
+    if (task.admissionReleased) return;
+    task.admissionReleased = true;
+    this.admitted--;
+    task.expiresAt = this.now() + this.limits.retentionMs;
+    if (this.shutdownFinalized) this.forgetTask(task);
+    else this.armExpiry();
+  }
+
+  private forgetTask(task: Task): void {
+    if (this.tasks.delete(task.transferId)) this.memoryUsed -= task.accountedBytes;
   }
 
   private summary(task: Task): Record<string, unknown> {
@@ -435,9 +467,11 @@ export class TransferManager {
               }
             });
         }
-        this.memoryUsed -= task.accountedBytes;
+        if (task.channelClosed) this.forgetTask(task);
       }
-      this.tasks.clear();
+      // Unclosed owners remain charged after the shutdown report. A later
+      // shared pool close can retire them without delaying/deadlocking exit.
+      this.shutdownFinalized = true;
       this.expired.clear();
       // Do not await failed-open physical-close tickets here. They may still
       // depend on the application's subsequent shared pool.dispose().
