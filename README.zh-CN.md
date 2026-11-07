@@ -67,6 +67,16 @@ node dist-test/test/run.js dist-test/test/shell-sequence.test.js
 
 统一入口会打印夹具根目录，并传给所有测试子进程。Windows 默认在 `<用户主目录>/vb-test/lite-ssh-mcp/` 下创建独立运行目录；其他平台使用仓库内的 `vb-test/full-v2/portable/`。可用 `LSSH_TEST_ROOT` 覆盖根目录，相对路径按启动时的工作目录解析。请使用专用、自有的目录，不要指向真实 SSH 配置或密钥目录；测试不会修复现有父目录权限。测试结束后，仅清理输出中标明的本次运行夹具。
 
+### 真实 Linux Shell 测试（显式启用）
+
+Linux 环境具备 Bash、Zsh、Fish 以及 util-linux 的 `script`/`stty` 后，先构建，再运行：
+
+```sh
+LSSH_REAL_SHELLS=1 node dist-test/test/run.js dist-test/test/real-shell.test.js
+```
+
+测试使用真实 PTY 和 Shell、仅监听 `127.0.0.1` 的临时 SSH 服务，以及生产 MCP stdio 入口；主目录、配置、历史和缓存均隔离，子进程 PID 记录在夹具根目录下。不修改登录 Shell 或系统 sshd。不启用时明确跳过；启用后平台错误或缺少依赖会失败，不会静默跳过。这不等同于生产 OpenSSH、自定义启动配置或 macOS 验收。
+
 ## 配置 SSH 连接
 
 首次启动时，服务会在当前用户主目录的 `.lite-ssh` 文件夹中创建：

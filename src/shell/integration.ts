@@ -23,10 +23,10 @@
  *  - The saved `stty -g` string is restored verbatim (including a case where
  *    echo was originally off) before the first prompt.
  *  - Bash < 4.4 has no `PS0`; that case reports UNSUPPORTED instead of
- *    pretending integration is ready. Zsh/Fish scripts are generated and are
- *    validated as strings only on this Windows M0 host; they are not executed
- *    against a real remote Zsh/Fish here (Bash is exercised natively by the M0
- *    check only).
+ *    pretending integration is ready. Real Linux Bash/Zsh/Fish behavior is
+ *    covered by the opt-in PTY/SSH/MCP tests in test/real-shell.test.ts. That
+ *    coverage does not certify arbitrary user startup files, production
+ *    OpenSSH configurations, or macOS runtime behavior.
  *  - Every returned command ends with CR, the byte an interactive PTY expects
  *    after a submitted line.
  *

@@ -67,6 +67,16 @@ node dist-test/test/run.js dist-test/test/shell-sequence.test.js
 
 The common runner prints its fixture root and passes it to every child test. Windows defaults to a new run under `<user-home>/vb-test/lite-ssh-mcp/`; other platforms use `vb-test/full-v2/portable/` in the checkout. `LSSH_TEST_ROOT` overrides the base (relative paths use the invoking working directory). Choose a dedicated, owned directory—not real SSH configuration or key folders. Tests do not repair existing parent-directory permissions. Remove only the reported run-specific fixtures after testing.
 
+### Real Linux shell tests (opt-in)
+
+With Bash, Zsh, Fish, and util-linux `script`/`stty` available on Linux, run after building:
+
+```sh
+LSSH_REAL_SHELLS=1 node dist-test/test/run.js dist-test/test/real-shell.test.js
+```
+
+These tests use real PTYs and shells, a temporary SSH server bound only to `127.0.0.1`, and the production MCP stdio entrypoint. Homes, configuration, history, and caches are isolated; child PIDs are recorded beneath the fixture root. They do not modify the login shell or system sshd. Without the flag they are explicitly skipped; with it, a wrong platform or missing prerequisites fails rather than silently skipping. This does not certify production OpenSSH, custom startup files, or macOS.
+
 ## Configure SSH logins
 
 On first startup, the server creates these files in `.lite-ssh` under the current user's home directory:

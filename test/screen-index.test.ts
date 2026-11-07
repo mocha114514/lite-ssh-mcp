@@ -184,3 +184,25 @@ test('alternate-buffer margin changes do not overwrite the normal-buffer margin'
     assert.equal(f.body(), 'ABC');
   } finally { f.model.dispose(); }
 });
+
+
+test('checkpoint redraw controls reach READY within the initialization budget', { timeout: 10_000 }, async () => {
+  const lines: ParsedLine[] = [];
+  const markers: string[] = [];
+  const model = new ScreenModel({
+    nonce: 'checkpoint-redraw', cols: 80, rows: 3,
+    onLine: line => lines.push(line),
+    onMarker: marker => markers.push(marker.kind),
+  });
+  try {
+    // A non-advancing NEL keeps a witness for an eventual same-glyph rewrite.
+    // Pure cursor controls must not discard it. This stream used to restart a
+    // native write timer per byte, starving even a READY already in the input.
+    await model.write('\x1b[1;2r\x1b[3;1HABC\x1bE');
+    await model.write('\x1b[3;1H'.repeat(1000) +
+      'ABC\x1b]777;LSSH;checkpoint-redraw;READY;fish\x07');
+    model.flushLine();
+    assert.deepEqual(markers, ['ready']);
+    assert.equal(lines.map(line => line.text + (line.newline ? '\n' : '')).join(''), 'ABCABC');
+  } finally { model.dispose(); }
+});

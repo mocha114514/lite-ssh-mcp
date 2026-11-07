@@ -602,39 +602,49 @@ export class ScreenModel {
   /** Keep the old prefix until a native cursor/cell change witnesses rewriting.
    * A witness is sticky: restoring the cursor later cannot hide those glyphs.
    * Public cursor controls update the clean baseline without inventing output. */
-  private async writeWithRewriteCheckpoint(bytes: Uint8Array, controlOnly: boolean): Promise<void> {
+  private writeWithRewriteCheckpoint(bytes: Uint8Array, controlOnly: boolean): Promise<void> {
     const captureSize = Math.max(1, this.terminal.cols);
-    for (let offset = 0; offset < bytes.length; offset++) {
-      if (!this.rewriteCheckpoints.normal && !this.rewriteCheckpoints.alternate) {
-        await this.writeChunk(bytes.subarray(offset));
-        return;
-      }
-      this.rewriteControlOnly = controlOnly || bytes[offset]! < 32 || bytes[offset] === 127;
-      await new Promise<void>((resolve, reject) => {
-        this.terminal.write(bytes.subarray(offset, offset + 1), () => {
-          try {
-            if (this.frameFailure) throw this.frameFailure.error;
-            const buffer = this.terminal.buffer.active;
-            const before = this.rewriteCheckpoints[buffer.type];
-            if (before) {
-              const after = this.rewriteState();
-              if (this.rewriteControlOnly) this.rewriteCheckpoints[buffer.type] = after;
-              else if (before.baseY !== after.baseY || before.x !== after.x || before.y !== after.y ||
-                  before.lines.length !== after.lines.length || after.lines.some((line, row) => line !== before.lines[row])) {
-                this.forgetEmitted(buffer);
+    return new Promise<void>((resolve, reject) => {
+      let offset = 0;
+      const writeNext = (): void => {
+        if (offset === bytes.length) { resolve(); return; }
+        if (!this.rewriteCheckpoints.normal && !this.rewriteCheckpoints.alternate) {
+          void this.writeChunk(bytes.subarray(offset)).then(resolve, reject);
+          return;
+        }
+        this.rewriteControlOnly = controlOnly || bytes[offset]! < 32 || bytes[offset] === 127;
+        try {
+          this.terminal.write(bytes.subarray(offset, offset + 1), () => {
+            try {
+              if (this.frameFailure) throw this.frameFailure.error;
+              const buffer = this.terminal.buffer.active;
+              const before = this.rewriteCheckpoints[buffer.type];
+              if (before) {
+                const after = this.rewriteState();
+                if (this.rewriteControlOnly) this.rewriteCheckpoints[buffer.type] = after;
+                else if (before.baseY !== after.baseY || before.x !== after.x || before.y !== after.y ||
+                    before.lines.length !== after.lines.length || after.lines.some((line, row) => line !== before.lines[row])) {
+                  this.forgetEmitted(buffer);
+                }
               }
-            }
-            // Observation bytes are not new body-capture boundaries: the
-            // first rewrite can still leave old suffix cells in this row.
-            // Match the ordinary bounded write pieces, including while a
-            // normal checkpoint remains dormant. Retain pre-eviction capture.
-            if (buffer.type === 'alternate' &&
-                ((offset + 1) % captureSize === 0 || offset + 1 === bytes.length)) this.flushLine();
-            resolve();
-          } catch (error) { reject(error); }
-        });
-      });
-    }
+              // Observation bytes are not new body-capture boundaries: the
+              // first rewrite can still leave old suffix cells in this row.
+              // Match ordinary bounded pieces, including dormant checkpoints.
+              if (buffer.type === 'alternate' &&
+                  ((offset + 1) % captureSize === 0 || offset + 1 === bytes.length)) this.flushLine();
+              offset++;
+              // Queue the next byte before returning to xterm, just as writeChunk
+              // does for ordinary batches. Awaiting each byte outside this native
+              // callback would restart its timer for every control byte: Fish's
+              // redraw stream then delays an already-emitted READY past its deadline.
+              // Byte-level witnesses and asynchronous parser backpressure stay intact.
+              writeNext();
+            } catch (error) { reject(error); }
+          });
+        } catch (error) { reject(error); }
+      };
+      writeNext();
+    });
   }
 
   /** Pause the native parser, not a second input parser or a growing frame
