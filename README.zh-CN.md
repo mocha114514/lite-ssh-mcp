@@ -110,6 +110,8 @@ node dist-test/test/run.js dist-test/test/shell-sequence.test.js
 
 首次连接或服务器主机密钥变化时，会提示来源核对。
 
+连接使用 SSH 协议层保活：间隔 30 秒，允许连续 3 次探测未响应，超过阈值后断开失联连接。保活不向终端输入字符，也不会回收健康的空闲终端；连接断开后不会自动重连或重放输入。
+
 ## 许可证
 
 [MIT](LICENSE) © 2026 mocha114514。

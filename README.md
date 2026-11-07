@@ -110,6 +110,8 @@ Omit `passphrase` if the private key is not encrypted.
 
 On the first connection or after a server host-key change, you will be prompted to verify the server's identity.
 
+Connections use SSH-level keepalives with a 30-second interval and an unanswered-probe limit of 3. These detect unresponsive connections without sending terminal input or retiring healthy idle terminals. Lost connections are not automatically reconnected, and input is never replayed.
+
 ## License
 
 [MIT](LICENSE) © 2026 mocha114514.

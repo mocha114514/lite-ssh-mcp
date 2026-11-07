@@ -109,8 +109,10 @@ test('pool disposal tracks login resolution before its first asynchronous yield'
   assert.equal(connects.mock.callCount(), 0);
 });
 
-test('only the final shared lease closes the owner; concurrent release is idempotent', async t => {
-  t.mock.method(ssh2.Client.prototype, 'connect', function (this: Client) {
+test('keepalive-enabled shared leases close only on final idempotent release', async t => {
+  const configs: ConnectConfig[] = [];
+  t.mock.method(ssh2.Client.prototype, 'connect', function (this: Client, config: ConnectConfig) {
+    configs.push(config);
     queueMicrotask(() => this.emit('ready'));
     return this;
   });
@@ -124,6 +126,9 @@ test('only the final shared lease closes the owner; concurrent release is idempo
     const first = await pool.acquire(target);
     const second = await pool.acquire(target);
     assert.equal(first.client, second.client);
+    assert.equal(configs.length, 1, 'keepalive belongs to the shared SSH transport');
+    assert.equal(configs[0]?.keepaliveInterval, 30_000);
+    assert.equal(configs[0]?.keepaliveCountMax, 3);
     await first.release();
     assert.equal(end.mock.callCount(), 0);
     assert.equal(destroy.mock.callCount(), 0);
@@ -132,6 +137,43 @@ test('only the final shared lease closes the owner; concurrent release is idempo
     await releasing;
     assert.equal(end.mock.callCount(), 1);
     assert.equal(destroy.mock.callCount(), 0);
+  } finally { await pool.dispose(); }
+});
+
+test('a post-ready keepalive timeout retires on actual close without automatic reconnection', async t => {
+  const clients: Client[] = [];
+  const configs: ConnectConfig[] = [];
+  t.mock.method(ssh2.Client.prototype, 'connect', function (this: Client, config: ConnectConfig) {
+    clients.push(this);
+    configs.push(config);
+    queueMicrotask(() => this.emit('ready'));
+    return this;
+  });
+  t.mock.method(ssh2.Client.prototype, 'end', function (this: Client) {
+    queueMicrotask(() => this.emit('close'));
+    return this;
+  });
+  const pool = new ConnectionPool(store(async () => resolved));
+  try {
+    const first = await pool.acquire(target);
+    const second = await pool.acquire(target);
+    assert.equal(first.client, second.client);
+    // ssh2 uses this error level for keepalive loss as well as handshake
+    // timeout. This is a synthetic post-ready event, not a VPS fault injection.
+    first.client.emit('error', Object.assign(new Error('Keepalive timeout'), { level: 'client-timeout' }));
+    first.client.emit('close');
+    await first.release();
+    await second.release();
+    assert.equal(clients.length, 1, 'closing must not schedule replacement connections');
+
+    // A later explicit user acquisition is allowed to create a new transport;
+    // it inherits the same policy rather than silently disabling keepalives.
+    const replacement = await pool.acquire(target);
+    assert.notEqual(replacement.client, first.client);
+    assert.equal(clients.length, 2);
+    assert.equal(configs[1]?.keepaliveInterval, 30_000);
+    assert.equal(configs[1]?.keepaliveCountMax, 3);
+    await replacement.release();
   } finally { await pool.dispose(); }
 });
 

@@ -11,6 +11,8 @@ import { ClientOwner } from './clientOwner.js';
 import { readPrivateKey } from './privateKey.js';
 
 const DEFAULT_READY_TIMEOUT_MS = 20_000;
+const KEEPALIVE_INTERVAL_MS = 30_000;
+const KEEPALIVE_COUNT_MAX = 3;
 const MAX_CONNECTIONS = 32;
 
 interface HostKeyObservation {
@@ -289,7 +291,18 @@ export class ConnectionPool {
       return true;
     };
 
-    const config: ConnectConfig = { host: ip, port, username, readyTimeout: this.readyTimeoutMs, hostVerifier };
+    // ssh2 owns protocol-level liveness probes for this shared transport.
+    // This is not a PTY idle timeout: healthy idle leases stay alive, and a
+    // lost connection still follows normal close ownership without replay.
+    const config: ConnectConfig = {
+      host: ip,
+      port,
+      username,
+      readyTimeout: this.readyTimeoutMs,
+      keepaliveInterval: KEEPALIVE_INTERVAL_MS,
+      keepaliveCountMax: KEEPALIVE_COUNT_MAX,
+      hostVerifier,
+    };
     if (resolved.auth.type === 'password') {
       config.password = resolved.auth.password;
     } else {
