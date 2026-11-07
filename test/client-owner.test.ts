@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
-import ssh2, { type Client } from 'ssh2';
+import ssh2, { type Client, type ConnectConfig } from 'ssh2';
 import type { ConfigStore } from '../src/config/store.js';
 import type { ResolvedLogin } from '../src/core/types.js';
 import { ClientOwner } from '../src/ssh/clientOwner.js';
@@ -34,6 +34,33 @@ const resolved: ResolvedLogin = {
   revision: 'synthetic_revision'
 };
 const store = (resolveLogin: () => Promise<ResolvedLogin>) => ({ resolveLogin }) as unknown as ConfigStore;
+
+for (const delivery of ['event', 'throw'] as const) {
+  for (const rejectHostKey of [false, true]) {
+    test(`handshake client-timeout via ${delivery} preserves ${rejectHostKey ? 'host-key rejection' : 'timeout classification'}`, async t => {
+      t.mock.method(ssh2.Client.prototype, 'connect', function (this: Client, config: ConnectConfig) {
+        if (rejectHostKey) {
+          const verify = config.hostVerifier as (key: Buffer) => boolean;
+          assert.equal(verify(Buffer.from('synthetic invalid host key')), false);
+        }
+        const error = Object.assign(new Error('Timed out while waiting for handshake'), { level: 'client-timeout' });
+        if (delivery === 'throw') throw error;
+        this.emit('error', error);
+        return this;
+      });
+      t.mock.method(ssh2.Client.prototype, 'end', function (this: Client) {
+        queueMicrotask(() => this.emit('close'));
+        return this;
+      });
+      const pool = new ConnectionPool(store(async () => resolved));
+      try {
+        await assert.rejects(pool.acquire(target), {
+          code: rejectHostKey ? 'HOST_KEY_UNTRUSTED' : 'CONNECT_TIMEOUT',
+        });
+      } finally { await pool.dispose(); }
+    });
+  }
+}
 
 test('owned client grace expiry destroys once and awaits the actual close event', async () => {
   const client = new SyntheticClient();

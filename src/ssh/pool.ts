@@ -42,6 +42,11 @@ function tupleKey(resolved: ResolvedLogin): string {
 }
 
 function mapConnectError(error: unknown): LiteSshError {
+  // ssh2 reports readyTimeout through an error with this level, not a
+  // standalone timeout event. Use its classification rather than message text.
+  if (error instanceof Error && 'level' in error && error.level === 'client-timeout') {
+    return new LiteSshError('CONNECT_TIMEOUT', 'The SSH handshake did not complete before the deadline.');
+  }
   const message = error instanceof Error ? error.message : '';
   if (/auth/i.test(message)) return new LiteSshError('AUTH_FAILED', 'SSH authentication failed.');
   return new LiteSshError('CONNECTION_LOST', 'The SSH connection failed before it became ready.');
@@ -332,7 +337,7 @@ export class ConnectionPool {
       try {
         client.connect(config);
       } catch (error) {
-        fail(mapConnectError(error));
+        fail(rejectionOf() ?? mapConnectError(error));
       }
     });
   }
