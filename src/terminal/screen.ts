@@ -149,6 +149,8 @@ export class ScreenModel {
   private readonly onLine?: (line: ParsedLine) => void;
   private readonly onMarker?: (marker: ShellMarker) => void;
   private readonly onFrame?: (screen: ScreenSnapshot, label?: string) => void;
+  private readonly beforeFrame?: () => Promise<void> | undefined;
+  private frameFailure?: { error: unknown };
   private readonly onReply?: (data: string) => void;
   private readonly terminal: XtermTerminal;
   private readonly disposables: IDisposable[] = [];
@@ -203,6 +205,7 @@ export class ScreenModel {
     this.onLine = options.onLine;
     this.onMarker = options.onMarker;
     this.onFrame = options.onFrame;
+    this.beforeFrame = options.beforeFrame;
     this.onReply = options.onReply;
     this.terminal = new headless.Terminal({
       // buffer/parser/modes are proposed API but stable in headless xterm.
@@ -214,7 +217,7 @@ export class ScreenModel {
     // false lets xterm's default handler perform the switch itself.
     const altScreenSwitch = (final: 'h' | 'l') =>
       this.terminal.parser.registerCsiHandler({ prefix: '?', final }, (params) => {
-        if (hasAltScreenMode(params)) this.captureBeforeSwitch(final === 'h');
+        if (hasAltScreenMode(params)) return this.captureBeforeSwitch(final === 'h');
         return false;
       });
     // Capture the readable line before an erase discards it (ED/EL); again
@@ -231,9 +234,8 @@ export class ScreenModel {
       this.terminal.parser.registerEscHandler({ final: '8' }, () => {
         this.rewriteControlOnly = true;
         this.flushLine();
-        this.onFrame?.(this.buildSnapshot(), 'cursor-restore');
         this.preserveAddressedRows(this.terminal.buffer.active);
-        return false;
+        return this.captureParserFrame('cursor-restore');
       }),
       // IND/NEL have no onLineFeed event. Preserve real line endings before
       // native indexing, but keep the current row identity when it cannot move.
@@ -250,7 +252,6 @@ export class ScreenModel {
         this.terminal.parser.registerCsiHandler({ final }, (params) => {
           this.rewriteControlOnly = true;
           this.flushLine();
-          this.onFrame?.(this.buildSnapshot(), 'cursor-address');
           const buffer = this.terminal.buffer.active;
           if (['X', 'P', '@'].includes(final)) {
             // Character edits over unused padding do not change body identity.
@@ -258,7 +259,7 @@ export class ScreenModel {
             if (this.characterEditTouchesText(buffer, final, params)) this.forgetEmitted(buffer);
           } else if (['L', 'M', 'S', 'T'].includes(final)) this.forgetEmitted(buffer);
           else this.preserveAddressedRows(buffer);
-          return false;
+          return this.captureParserFrame('cursor-address');
         })),
       this.terminal.buffer.onBufferChange(buffer => {
         if (buffer.type !== 'alternate') return;
@@ -297,6 +298,7 @@ export class ScreenModel {
    */
   async write(data: string | Uint8Array): Promise<ScreenSnapshot> {
     this.assertLive();
+    if (this.frameFailure) throw this.frameFailure.error;
     // A trailing CR was already applied to the emulator. Only its history
     // classification waits: CRLF is one hard newline, a lone CR may overwrite.
     let destructive = false;
@@ -372,6 +374,7 @@ export class ScreenModel {
       const end = Math.min(offset + size, bytes.length);
       this.terminal.write(bytes.subarray(offset, end), () => {
         try {
+          if (this.frameFailure) throw this.frameFailure.error;
           if (this.terminal.buffer.active.type === 'alternate') this.flushLine();
           if (end === bytes.length) onParsed();
         } catch (error) { onError(error); }
@@ -610,6 +613,7 @@ export class ScreenModel {
       await new Promise<void>((resolve, reject) => {
         this.terminal.write(bytes.subarray(offset, offset + 1), () => {
           try {
+            if (this.frameFailure) throw this.frameFailure.error;
             const buffer = this.terminal.buffer.active;
             const before = this.rewriteCheckpoints[buffer.type];
             if (before) {
@@ -633,20 +637,39 @@ export class ScreenModel {
     }
   }
 
+  /** Pause the native parser, not a second input parser or a growing frame
+   * queue. Session resizes share its output queue while this hook is suspended.
+   * Always fulfill the native hook: propagate failures through our write
+   * callback instead of leaving xterm with a rejected/abandoned parser pause. */
+  private captureParserFrame(label: string): boolean | Promise<boolean> {
+    if (!this.onFrame || this.frameFailure) return false;
+    const fail = (error: unknown): boolean => {
+      this.frameFailure ??= { error };
+      return false;
+    };
+    const capture = (): boolean => {
+      this.onFrame?.(this.buildSnapshot(), label);
+      return false; // Preserve native control handling after recording.
+    };
+    try {
+      const barrier = this.beforeFrame?.();
+      return barrier ? barrier.then(capture).catch(fail) : capture();
+    } catch (error) { return fail(error); }
+  }
+
   /** RIS replaces both native buffers. Capture the outgoing readable state
    * before reset, then discard prefix identities from those discarded cells.
    * Returning false preserves xterm's native reset and mode/style handling. */
-  private captureBeforeReset(): boolean {
+  private captureBeforeReset(): boolean | Promise<boolean> {
     if (this.disposed) return false;
     this.flushLine();
-    this.onFrame?.(this.buildSnapshot(), 'reset');
     this.cursors.normal = newCursor();
     this.cursors.alternate = newCursor();
     delete this.scrollBottom.normal;
     delete this.scrollBottom.alternate;
     delete this.rewriteCheckpoints.normal;
     delete this.rewriteCheckpoints.alternate;
-    return false;
+    return this.captureParserFrame('reset');
   }
 
   /**
@@ -754,12 +777,11 @@ export class ScreenModel {
    * is preserved by xterm, so its dedup state is kept and a restored in-progress
    * line is not re-emitted when its command later completes.
    */
-  private captureBeforeSwitch(enteringAlternate: boolean): void {
+  private captureBeforeSwitch(enteringAlternate: boolean): boolean | Promise<boolean> {
     this.rewriteControlOnly = true;
-    if (this.disposed) return;
-    if ((this.terminal.buffer.active.type === 'alternate') === enteringAlternate) return;
+    if (this.disposed) return false;
+    if ((this.terminal.buffer.active.type === 'alternate') === enteringAlternate) return false;
     this.flushLine();
-    this.onFrame?.(this.buildSnapshot(), enteringAlternate ? 'alt-enter' : 'alt-exit');
     this.cursors.alternate = newCursor();
     delete this.scrollBottom.alternate;
     // The outgoing ALT cells are captured above and then discarded. Their
@@ -767,6 +789,7 @@ export class ScreenModel {
     // the normal checkpoint still belongs to its preserved native buffer.
     delete this.rewriteCheckpoints.alternate;
     this.pendingSwitchScrolls += 1;
+    return this.captureParserFrame(enteringAlternate ? 'alt-enter' : 'alt-exit');
   }
 
   /**
@@ -778,7 +801,7 @@ export class ScreenModel {
    * glyphs is retained. Unchanged rows (including earlier soft-wrap fragments)
    * keep their bounded addressed-row baselines instead of being emitted again.
    */
-  private captureBeforeErase(final: 'J' | 'K', params: readonly (number | number[])[]): boolean {
+  private captureBeforeErase(final: 'J' | 'K', params: readonly (number | number[])[]): boolean | Promise<boolean> {
     if (this.disposed) return false;
     this.rewriteControlOnly = true;
     const buffer = this.terminal.buffer.active;
@@ -817,8 +840,7 @@ export class ScreenModel {
         }
       }
     }
-    this.onFrame?.(this.buildSnapshot(), final === 'J' ? 'erase-j' : 'erase-k');
-    return false;
+    return this.captureParserFrame(final === 'J' ? 'erase-j' : 'erase-k');
   }
 
   private emitLine(text: string, wrapped: boolean, buffer: BufferType): void {

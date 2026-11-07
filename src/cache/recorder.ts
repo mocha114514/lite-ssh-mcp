@@ -380,6 +380,14 @@ export class ReadableRecorder {
     await this.queue.flush();
   }
 
+  /** Only pause a frame-producing parser hook when real writes are outstanding.
+   * Draining BEFORE the next frame keeps even a large frame from being added
+   * on top of an old backlog. The existing per-chunk hard budget is unchanged. */
+  drainBeforeFrame(): Promise<void> | undefined {
+    if (this.queue.hasWork || this.queue.failed) return this.flush();
+    return undefined;
+  }
+
   /** Sticky write queue failure, if any has occurred. */
   get failed(): LiteSshError | undefined {
     return this.queue.failed;

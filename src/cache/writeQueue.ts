@@ -61,6 +61,12 @@ export class BoundedWriteQueue {
     return this.failure;
   }
 
+  /** Includes the in-flight write: a parser barrier must not mistake it for
+   * an idle recorder merely because it has left the pending buffer array. */
+  get hasWork(): boolean {
+    return this.writing || this.pending.length > 0 || this.noticePending;
+  }
+
   /**
    * Queue one chunk. Never throws: a synchronous callback cannot surface a
    * rejection, so failures are sticky and reported through `flush()`/`failed`

@@ -67,6 +67,9 @@ export interface ScreenOptions {
   onMarker?: (marker: ShellMarker) => void;
   /** Readable state before destructive buffer/erase transitions within one input chunk. */
   onFrame?: (screen: ScreenSnapshot, label?: string) => void;
+  /** Optional parser-only flow control before publishing a frame. A rejected
+   * barrier rejects write(); synchronous snapshot/resize APIs do not await it. */
+  beforeFrame?: () => Promise<void> | undefined;
   onReply?: (data: string) => void;
 }
 

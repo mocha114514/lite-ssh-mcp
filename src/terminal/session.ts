@@ -145,6 +145,7 @@ export class TerminalSession {
         try { this.recorder.recordLine(line); } catch (error) { this.failRecording(error); }
       },
       onMarker: marker => this.onMarker(marker),
+      beforeFrame: () => this.recorder.drainBeforeFrame(),
       onFrame: (snapshot, label) => {
         try { this.recorder.recordFrame(snapshot, label); } catch (error) { this.failRecording(error); }
       },
@@ -917,15 +918,25 @@ export class TerminalSession {
     try {
       // Await the queued work itself: returning its promise would release this
       // credit in finally before the window change and cache flush settle.
-      return await this.sends.run(async () => {
+      return await this.sends.run(() => this.output.run(async () => {
+        // A frame hook may be suspended on disk backpressure. Do not mutate
+        // either PTY size or the native screen until that output work settles.
+        if (this.status !== 'open' || !this.channel) throw new LiteSshError('TERMINAL_CLOSED', 'The terminal is not open.');
+        await this.recorder.flush();
         if (this.status !== 'open' || !this.channel) throw new LiteSshError('TERMINAL_CLOSED', 'The terminal is not open.');
         this.channel.setWindow(rows, cols, 0, 0);
         const screen = this.screen.resize(cols, rows);
+        // The synchronous resize captured its old frame. Keep the new full
+        // frame from being added on top of it when recording is slow.
+        await this.recorder.flush();
         this.recorder.recordFrame(screen, 'RESIZE');
         await this.recorder.flush();
         this.notify();
         return this.current();
-      });
+      }));
+    } catch (error) {
+      if (error instanceof LiteSshError && error.code === 'CACHE_WRITE_FAILED') this.failRecording(error);
+      throw error;
     } finally {
       this.retainedResizes--;
     }
