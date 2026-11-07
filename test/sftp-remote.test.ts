@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { SFTPWrapper } from 'ssh2';
+import type { Client, SFTPWrapper } from 'ssh2';
 import { RemoteFileSystem } from '../src/sftp/remote.js';
 import { TRANSFER_LIMITS } from '../src/sftp/types.js';
 
@@ -30,6 +30,29 @@ class Channel extends EventEmitter {
   }
 }
 const remote = (channel: Channel) => new RemoteFileSystem(channel as unknown as SFTPWrapper, 25, 25);
+
+for (const event of ['close', 'error'] as const) {
+  test(`SFTP open owns an immediate ${event} before the successful callback returns`, async () => {
+    const channel = new Channel();
+    let listenersAfterCallback = 0;
+    const client = Object.assign(new EventEmitter(), {
+      sftp(callback: (error: Error | undefined, channel: SFTPWrapper) => void) {
+        callback(undefined, channel as unknown as SFTPWrapper);
+        listenersAfterCallback = channel.listenerCount(event);
+        if (event === 'error') channel.emit('error', new Error('fixture immediate error'));
+        else channel.emit('close');
+      },
+    });
+    const fs = await RemoteFileSystem.open(client as unknown as Client);
+    try {
+      assert.ok(listenersAfterCallback > 0, 'ownership must precede callback return, not the await continuation');
+      await assert.rejects(fs.lstat('/synthetic'), { code: 'CONNECTION_LOST' });
+      assert.equal(channel.ended, 0, 'receiving an event must not prematurely end the channel');
+      assert.equal(await fs.dispose(), true);
+      assert.equal(channel.ended, event === 'close' ? 0 : 1);
+    } finally { await fs.dispose(); }
+  });
+}
 
 test('SFTP error rejects pending operations but is not a confirmed close event', async () => {
   const channel = new Channel();

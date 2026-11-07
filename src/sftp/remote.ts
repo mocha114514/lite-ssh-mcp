@@ -58,7 +58,7 @@ export class RemoteFileSystem implements TransferFileSystem {
   }
   static async open(client: Client, options?: RemoteOpenOptions): Promise<RemoteFileSystem> {
     const timeoutMs = options?.timeoutMs ?? 15_000;
-    const channel = await new Promise<SFTPWrapper>((resolve, reject) => {
+    return new Promise<RemoteFileSystem>((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
       let settled = false;
       let cleanupResolved = false;
@@ -151,8 +151,12 @@ export class RemoteFileSystem implements TransferFileSystem {
               { cleanupPending: !cleanupResolved }
             ));
           } else {
+            // Take channel ownership before returning to ssh2. A close/error
+            // may follow this callback synchronously, before any awaiting
+            // caller resumes; resolving the raw channel would lose that event.
+            const remote = new RemoteFileSystem(chan);
             client.removeListener('close', onClientClose);
-            resolve(chan);
+            resolve(remote);
           }
         });
       } catch {
@@ -162,7 +166,6 @@ export class RemoteFileSystem implements TransferFileSystem {
         reject(new LiteSshError('SFTP_UNAVAILABLE', 'The server could not open an SFTP channel.'));
       }
     });
-    return new RemoteFileSystem(channel);
   }
   key(value: string): string { return this.paths.normalize(value); }
   validate(value: string): void { normalizeRemotePath(value); }
