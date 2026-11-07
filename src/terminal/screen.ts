@@ -157,6 +157,13 @@ export class ScreenModel {
     alternate: newCursor(),
   };
   /**
+   * The public xterm buffer exposes cursor positions but not its scroll margin.
+   * Mirror only the accepted bottom margin (DECSTBM), separately per buffer;
+   * reset/switch/resize paths below keep it aligned with the native emulator.
+   * An absent entry means the default last row, not an unknown cursor state.
+   */
+  private readonly scrollBottom: Partial<Record<BufferType, number>> = {};
+  /**
    * Number of `onScroll` events seen per buffer. Each scroll creates exactly one
    * row, so with a recorded baseline `evicted = baseLength + (scrolled - baseScrolled) - length`
    * is the exact number of rows evicted from the front. Row sequences built from
@@ -171,14 +178,14 @@ export class ScreenModel {
    * boundary is a CRLF or an overwrite waits for the next received byte.
    */
   private pendingCr = false;
-  /** One bounded readable-state checkpoint per buffer. CR/BS have captured
-   * the old cells, but only a witnessed rewrite invalidates their prefix. */
+  /** One bounded readable-state checkpoint per buffer. CR/BS or a non-advancing
+   * index captured old cells; only a witnessed rewrite invalidates their prefix. */
   private readonly rewriteCheckpoints: Partial<Record<BufferType, { baseY: number; x: number; y: number; lines: string[] }>> = {};
   private rewriteControlOnly = false;
   /**
-   * Buffer switches make xterm emit a spurious `onScroll` (position 0) that adds
-   * no row; counting it would fake an eviction. Each captured switch arms one
-   * expected spurious scroll, which `onScroll` then ignores.
+   * Buffer switches emit a public `onScroll` notification without creating
+   * a row. Counting it would fake an eviction; each observed switch arms one
+   * notification to ignore.
    */
   private pendingSwitchScrolls = 0;
   private revision = 0;
@@ -213,7 +220,7 @@ export class ScreenModel {
     // Capture the readable line before an erase discards it (ED/EL); again
     // returning false so xterm still performs the erase.
     const eraseCapture = (final: 'J' | 'K') =>
-      this.terminal.parser.registerCsiHandler({ final }, () => this.captureBeforeErase(final));
+      this.terminal.parser.registerCsiHandler({ final }, params => this.captureBeforeErase(final, params));
     this.disposables.push(
       this.terminal.parser.registerOscHandler(MARKER_OSC_ID, (data) => this.handleOsc(data)),
       altScreenSwitch('h'),
@@ -228,25 +235,14 @@ export class ScreenModel {
         this.preserveAddressedRows(this.terminal.buffer.active);
         return false;
       }),
-      // NEL (Next Line, ESC E): Moves cursor to column 0 of next line (and scrolls if at bottom).
-      // Unlike LF, xterm does not fire onLineFeed for ESC E. Capture the completed line
-      // synchronously before xterm's native handler advances or scrolls the buffer, so
-      // lines are not lost to scrollback eviction and log integrity is preserved.
-      this.terminal.parser.registerEscHandler({ final: 'E' }, () => {
-        if (this.disposed) return false;
-        this.rewriteControlOnly = true;
-        const buffer = this.terminal.buffer.active;
-        this.captureUpTo(buffer.baseY + buffer.cursorY, true);
-        return false;
-      }),
-      // IND (Index, ESC D): Moves cursor down one row in same column (and scrolls if at bottom).
-      // Synchronously capture the completed row so non-LF indexing does not drop output.
-      this.terminal.parser.registerEscHandler({ final: 'D' }, () => {
-        if (this.disposed) return false;
-        this.rewriteControlOnly = true;
-        const buffer = this.terminal.buffer.active;
-        this.captureUpTo(buffer.baseY + buffer.cursorY, true);
-        return false;
+      // IND/NEL have no onLineFeed event. Preserve real line endings before
+      // native indexing, but keep the current row identity when it cannot move.
+      this.terminal.parser.registerEscHandler({ final: 'E' }, () => this.captureBeforeIndex('E')),
+      this.terminal.parser.registerEscHandler({ final: 'D' }, () => this.captureBeforeIndex('D')),
+      this.terminal.parser.registerCsiHandler({ final: 'r' }, params => this.captureScrollRegion(params)),
+      this.terminal.parser.registerCsiHandler({ intermediates: '!', final: 'p' }, () => {
+        delete this.scrollBottom[this.terminal.buffer.active.type];
+        return false; // DECSTR restores full-height margins in the active buffer.
       }),
       // Cursor addressing can replace cells without CR/BS or erase. Preserve
       // the chronological text/styles before xterm moves the write position.
@@ -330,24 +326,57 @@ export class ScreenModel {
   /** Writes one already-split chunk and resolves when xterm has parsed it. */
   private writeChunk(data: string | Uint8Array, controlOnly = false): Promise<void> {
     const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
-    if (bytes.length === 0) return Promise.resolve();
-    // Only a clean CR/BS checkpoint needs native callbacks between bytes.
-    // Ordinary streams and the suffix after a witnessed rewrite stay batched.
-    if (this.rewriteCheckpoints.normal || this.rewriteCheckpoints.alternate) {
-      return this.writeWithRewriteCheckpoint(bytes, controlOnly);
-    }
-    const size = Math.max(1, this.terminal.cols);
     return new Promise<void>((resolve, reject) => {
-      for (let offset = 0; offset < bytes.length; offset += size) {
-        const end = Math.min(offset + size, bytes.length);
-        this.terminal.write(bytes.subarray(offset, end), () => {
-          try {
-            if (this.terminal.buffer.active.type === 'alternate') this.flushLine();
-            if (end === bytes.length) resolve();
-          } catch (error) { reject(error); }
-        });
-      }
+      let offset = 0;
+      let failed = false;
+      const fail = (error: unknown): void => { failed = true; reject(error); };
+      const writeNext = (): void => {
+        if (failed) return;
+        if (offset === bytes.length) { resolve(); return; }
+        if (this.rewriteCheckpoints.normal || this.rewriteCheckpoints.alternate) {
+          void this.writeWithRewriteCheckpoint(bytes.subarray(offset), controlOnly).then(resolve, fail);
+          return;
+        }
+        // An IND/NEL hook can establish a checkpoint during native parsing.
+        // End the batch at that control so its following body is observed.
+        // These are conservative byte boundaries, not a second VT parser:
+        // xterm alone decides whether the candidate actually is IND/NEL.
+        let end = offset;
+        for (; end < bytes.length; end++) {
+          if (bytes[end] !== 0x44 && bytes[end] !== 0x45) continue; // D/E
+          let previous = end - 1;
+          // C0/DEL can execute/be ignored without leaving native ESC state.
+          // Reaching the input boundary also covers ESC split across writes.
+          while (previous >= 0 && bytes[previous] !== 0x1b &&
+                 (bytes[previous]! < 0x20 || bytes[previous] === 0x7f)) previous--;
+          if (previous < 0 || bytes[previous] === 0x1b) { end++; break; }
+        }
+        try {
+          this.writeBatch(bytes.subarray(offset, end), () => {
+            offset = end;
+            // Continue inside the native callback, not an awaited microtask.
+            // xterm can then drain its existing queue instead of scheduling a
+            // separate timer for every ordinary IND/NEL in a large stream.
+            writeNext();
+          }, fail);
+        } catch (error) { fail(error); }
+      };
+      writeNext();
     });
+  }
+
+  /** Queue ordinary spans in the existing column-sized capture pieces. */
+  private writeBatch(bytes: Uint8Array, onParsed: () => void, onError: (error: unknown) => void): void {
+    const size = Math.max(1, this.terminal.cols);
+    for (let offset = 0; offset < bytes.length; offset += size) {
+      const end = Math.min(offset + size, bytes.length);
+      this.terminal.write(bytes.subarray(offset, end), () => {
+        try {
+          if (this.terminal.buffer.active.type === 'alternate') this.flushLine();
+          if (end === bytes.length) onParsed();
+        } catch (error) { onError(error); }
+      });
+    }
   }
 
   /** Current readable screen. Never advances the revision by itself. */
@@ -363,8 +392,10 @@ export class ScreenModel {
     // new cursor at the reflowed prefix so later appends do not repeat history.
     this.flushLine();
     this.onFrame?.(this.buildSnapshot(), 'before-resize');
+    const resized = cols !== this.terminal.cols || rows !== this.terminal.rows;
     this.terminal.resize(cols, rows);
     for (const type of ['normal', 'alternate'] as const) {
+      if (resized) delete this.scrollBottom[type];
       const buffer = type === 'normal' ? this.terminal.buffer.normal : this.terminal.buffer.alternate;
       this.evictBaseScrolled[type] = this.scrolled[type];
       this.evictBaseLength[type] = buffer.length;
@@ -475,7 +506,7 @@ export class ScreenModel {
     if (this.disposed) return;
     const buffer = this.terminal.buffer.active;
     if (this.pendingSwitchScrolls > 0) {
-      // A buffer switch just happened and this scroll did not add a row.
+      // A buffer switch changed the viewport without adding a row.
       this.pendingSwitchScrolls -= 1;
       return;
     }
@@ -611,8 +642,58 @@ export class ScreenModel {
     this.onFrame?.(this.buildSnapshot(), 'reset');
     this.cursors.normal = newCursor();
     this.cursors.alternate = newCursor();
+    delete this.scrollBottom.normal;
+    delete this.scrollBottom.alternate;
     delete this.rewriteCheckpoints.normal;
     delete this.rewriteCheckpoints.alternate;
+    return false;
+  }
+
+  /**
+   * DECSTBM changes margins only when bottom > top. Match xterm's public
+   * control semantics: omitted/zero/oversized bottom means the last row;
+   * an invalid region leaves the previous one intact. Returning false lets
+   * xterm perform the actual cursor/margin update, including origin mode.
+   */
+  private captureScrollRegion(params: readonly (number | number[])[]): boolean {
+    this.rewriteControlOnly = true;
+    const first = params[0];
+    const second = params[1];
+    const top = (Array.isArray(first) ? first[0] : first) || 1;
+    const requestedBottom = (Array.isArray(second) ? second[0] : second) || this.terminal.rows;
+    const bottom = Math.min(requestedBottom, this.terminal.rows);
+    if (bottom > top) {
+      const buffer = this.terminal.buffer.active;
+      this.flushLine();
+      this.preserveAddressedRows(buffer);
+      this.scrollBottom[buffer.type] = bottom - 1;
+    }
+    return false;
+  }
+
+  /**
+   * At the bottom margin native indexing scrolls; above the physical last row
+   * it advances. Only the last physical row BELOW a shorter region is a no-op.
+   * NEL may still reset X there, but that alone is not a new readable line.
+   */
+  private captureBeforeIndex(final: 'D' | 'E'): boolean {
+    if (this.disposed) return false;
+    this.rewriteControlOnly = true;
+    const buffer = this.terminal.buffer.active;
+    const bottom = this.scrollBottom[buffer.type] ?? this.terminal.rows - 1;
+    if (buffer.cursorY < this.terminal.rows - 1 || buffer.cursorY === bottom) {
+      this.captureUpTo(buffer.baseY + buffer.cursorY, true);
+    } else if (final === 'E' || buffer.cursorX >= this.terminal.cols) {
+      // No vertical advance, but NEL returns to column zero; IND also clamps
+      // a pending-wrap X back into the row. Save cells before either can lead
+      // to overwrite. As with CR, only a subsequent native write invalidates
+      // the prefix, so repeated controls alone do not repeat the old body.
+      this.flushLine();
+      this.rewriteCheckpoints[buffer.type] = {
+        ...this.rewriteState(),
+        x: final === 'E' ? 0 : this.terminal.cols - 1,
+      };
+    }
     return false;
   }
 
@@ -680,6 +761,7 @@ export class ScreenModel {
     this.flushLine();
     this.onFrame?.(this.buildSnapshot(), enteringAlternate ? 'alt-enter' : 'alt-exit');
     this.cursors.alternate = newCursor();
+    delete this.scrollBottom.alternate;
     // The outgoing ALT cells are captured above and then discarded. Their
     // checkpoint must not force future normal output into bytewise parsing;
     // the normal checkpoint still belongs to its preserved native buffer.
@@ -688,20 +770,53 @@ export class ScreenModel {
   }
 
   /**
-   * Captures the readable line and screen immediately before an erase (ED/EL,
-   * `CSI ... J`/`K`). Always returns false so xterm's own erase still runs; this
-   * only preserves what the erase is about to discard.
+   * Preserve the outgoing view, then invalidate only rows whose occupied cells
+   * the native ED/EL operation will erase. Clearing unused padding is not new
+   * output: discarding its prefix would duplicate the body at the next LF.
    *
-   * The dedup state is forgotten afterwards because the erase discards the grid:
-   * text written into the same cells later (e.g. `abc` + `CSI 2J` + home + `abc`)
-   * is genuinely new output and must be emitted, not deduplicated against the
-   * pre-erase prefix.
+   * Real erasures still establish a new row identity, so rewriting identical
+   * glyphs is retained. Unchanged rows (including earlier soft-wrap fragments)
+   * keep their bounded addressed-row baselines instead of being emitted again.
    */
-  private captureBeforeErase(final: 'J' | 'K'): boolean {
+  private captureBeforeErase(final: 'J' | 'K', params: readonly (number | number[])[]): boolean {
     if (this.disposed) return false;
+    this.rewriteControlOnly = true;
     const buffer = this.terminal.buffer.active;
     this.flushLine();
-    this.forgetEmitted(buffer);
+    const first = params[0];
+    const mode = (Array.isArray(first) ? first[0] : first) ?? 0;
+
+    // ED 3 keeps visible cells. Its internal viewport notification is not
+    // forwarded by headless xterm's public onScroll: do not suppress the next
+    // real scroll. Buffer-length changes already account for removed history.
+    if (mode === 0 || mode === 1 || mode === 2) {
+      this.preserveAddressedRows(buffer);
+      const cursor = this.cursors[buffer.type];
+      const evicted = this.evictedRows(buffer);
+      const firstRow = final === 'K' || mode === 0 ? buffer.cursorY : 0;
+      const lastRow = final === 'K' || mode === 1 ? buffer.cursorY : this.terminal.rows - 1;
+      // xterm permits x == cols while a wrap is pending. EL 0 then erases
+      // nothing; clamping to cols - 1 would falsely invalidate the final glyph.
+      const column = Math.min(buffer.cursorX, this.terminal.cols);
+      for (let row = firstRow; row <= lastRow; row++) {
+        const absoluteRow = buffer.baseY + row;
+        const line = buffer.getLine(absoluteRow);
+        if (!line) continue;
+        let start = row === buffer.cursorY && mode === 0 ? column : 0;
+        const end = row === buffer.cursorY && mode === 1
+          ? Math.min(column + 1, this.terminal.cols)
+          : this.terminal.cols;
+        // Erasing the continuation half also removes its owning wide glyph.
+        if (start > 0 && start < end && line.getCell(start)?.getWidth() === 0 &&
+            line.getCell(start - 1)?.getWidth() === 2) start--;
+        for (let col = start; col < end; col++) {
+          if (!line.getCell(col)?.getChars()) continue;
+          cursor.addressedRows.set(absoluteRow + evicted, '');
+          delete this.rewriteCheckpoints[buffer.type];
+          break;
+        }
+      }
+    }
     this.onFrame?.(this.buildSnapshot(), final === 'J' ? 'erase-j' : 'erase-k');
     return false;
   }
