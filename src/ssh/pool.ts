@@ -2,6 +2,7 @@ import ssh2 from 'ssh2';
 import type { Client as Ssh2Client, ConnectConfig } from 'ssh2';
 import { createHmac, randomBytes } from 'node:crypto';
 import { LiteSshError } from '../core/errors.js';
+import { CleanupFailures } from '../core/cleanup.js';
 import { endpointKey, normalizeIp } from '../core/targets.js';
 import type { ConnectionLease, Endpoint, LoginTarget, ResolvedLogin } from '../core/types.js';
 import type { ConfigStore } from '../config/store.js';
@@ -69,6 +70,9 @@ export class ConnectionPool {
   private readonly observed = new Map<string, HostKeyObservation>();
   private disposed = false;
   private closing?: Promise<void>;
+  // Keep only the bounded cleanup fact, never the credential/error/path. A
+  // rejected acquisition can leave the active set long before application exit.
+  private privateKeyCloseUnconfirmed = false;
   private readonly acquiring = new Set<Promise<ConnectionLease>>();
   private readonly clients = new Set<ClientOwner>();
   private readonly reservations = new Set<ConnectionReservation>();
@@ -86,7 +90,15 @@ export class ConnectionPool {
     // merely after a socket has reached the pending/ready maps.
     const operation = this.acquireLease(target);
     this.acquiring.add(operation);
-    void operation.finally(() => this.acquiring.delete(operation)).catch(() => undefined);
+    void operation.then(
+      () => { this.acquiring.delete(operation); },
+      error => {
+        if (error instanceof LiteSshError && error.details.privateKeyHandleCloseConfirmed === false) {
+          this.privateKeyCloseUnconfirmed = true;
+        }
+        this.acquiring.delete(operation);
+      },
+    );
     return operation;
   }
 
@@ -201,11 +213,20 @@ export class ConnectionPool {
       const results = Promise.allSettled(closes);
       await Promise.allSettled([...this.acquiring]);
       const closed = await results;
+      const cleanup = new CleanupFailures();
       if (closed.some(result => result.status === 'rejected') || this.clients.size > 0) {
-        throw new LiteSshError('CONNECTION_CLEANUP_FAILED', 'One or more owned SSH clients did not confirm closure.', {
-          unconfirmedClients: this.clients.size
-        });
+        const facts = { unconfirmedClients: this.clients.size };
+        cleanup.add('connection', new LiteSshError(
+          'CONNECTION_CLEANUP_FAILED', 'One or more owned SSH clients did not confirm closure.', facts
+        ), 'CONNECTION_CLEANUP_FAILED', facts);
       }
+      if (this.privateKeyCloseUnconfirmed) {
+        const facts = { privateKeyHandleCloseConfirmed: false };
+        cleanup.add('connection', new LiteSshError(
+          'PRIVATE_KEY_CLEANUP_FAILED', 'A private-key file handle did not confirm closure.', facts
+        ), 'PRIVATE_KEY_CLEANUP_FAILED', facts);
+      }
+      cleanup.throwIfAny();
     })();
     return this.closing;
   }

@@ -439,6 +439,13 @@ export class TransferManager {
         // aggregate contains actual failed admission finalizers from F12.
         if (admission.status === 'rejected' && admission.reason instanceof CleanupError) {
           cleanup.add('sftp', admission.reason, 'SFTP_CLEANUP_FAILED');
+        } else if (admission.status === 'rejected' && admission.reason instanceof LiteSshError &&
+                   admission.reason.details.privateKeyHandleCloseConfirmed === false) {
+          // This can fail before a lease/channel exists. Preserve the explicit
+          // credential-handle fact without treating ordinary auth as cleanup.
+          cleanup.add('connection', admission.reason, 'PRIVATE_KEY_CLEANUP_FAILED', {
+            privateKeyHandleCloseConfirmed: false,
+          });
         }
       }
       const tasks = [...this.tasks.values()];

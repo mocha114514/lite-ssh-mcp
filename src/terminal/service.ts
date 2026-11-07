@@ -109,7 +109,8 @@ export class TerminalService {
       // actual cleanup/loss facts make it a shutdown failure as well.
       if (details.cacheRemoved === false || details.cacheCleanupUnknown === true ||
           details.remoteChannelCleanupConfirmed === false ||
-          details.connectionCleanupConfirmed === false || details.cacheMayBeIncomplete === true) {
+          details.connectionCleanupConfirmed === false || details.cacheMayBeIncomplete === true ||
+          details.privateKeyHandleCloseConfirmed === false) {
         cleanup.add('terminal', opening.reason, 'TERMINAL_CLEANUP_FAILED', terminalShutdownFacts(details));
       }
     }

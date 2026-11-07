@@ -8,6 +8,8 @@ import { test } from 'node:test';
 import ssh2, { type Client, type ParsedKey } from 'ssh2';
 import type { ConfigStore } from '../src/config/store.js';
 import { LiteSshError } from '../src/core/errors.js';
+import { CleanupError } from '../src/core/cleanup.js';
+import { createApplication } from '../src/app.js';
 import { ensurePrivateDirectory } from '../src/platform/permissions.js';
 import { readPrivateKey, MAX_PRIVATE_KEY_BYTES } from '../src/ssh/privateKey.js';
 import { ConnectionPool } from '../src/ssh/pool.js';
@@ -293,6 +295,29 @@ test('close rejection never returns credential bytes or native errors', async t 
     return true;
   });
   assert.equal(closed, 1);
+
+  // Exercise the same real reader failure through acquisition and app.close,
+  // after the failed terminal request has already left the opening registry.
+  const target = { ip: '127.0.0.1', port: 2222, username: 'synthetic_close' };
+  const app = createApplication({ configPath: path.join(f.directory, 'unused-config.json') });
+  t.mock.method(app.store, 'resolveLogin', async () => ({
+    target, auth: { type: 'privateKey' as const, privateKeyPath: f.file }, revision: 'synthetic_close',
+  }));
+  const connects = t.mock.method(ssh2.Client.prototype, 'connect', () => {
+    throw new Error('No SSH socket may be created after credential close failure');
+  });
+  await assert.rejects(app.terminals.open(target, 'synthetic_close'), { code: 'AUTH_FAILED' });
+  await assert.rejects(app.close(), error => {
+    assert.ok(error instanceof CleanupError);
+    assert.ok(error.failures.some(item => item.facts?.privateKeyHandleCloseConfirmed === false));
+    const exposed = JSON.stringify(error.toResult());
+    assert.equal(exposed.includes(f.key), false);
+    assert.equal(exposed.includes(f.file), false);
+    assert.equal(exposed.includes('synthetic_secret_close_message'), false);
+    return true;
+  });
+  assert.equal(closed, 2);
+  assert.equal(connects.mock.callCount(), 0);
 });
 
 test('a substituted acquired FD is rejected before reading bytes and is still closed', async t => {

@@ -53,7 +53,7 @@ export function terminalShutdownFacts(
   const fields = [
     'cachePath', 'cacheRemoved', 'cleanupError', 'cacheCleanupUnknown',
     'localTerminalClosed', 'remoteChannelCleanupConfirmed',
-    'connectionCleanupConfirmed', 'connectionCleanupErrorCode',
+    'connectionCleanupConfirmed', 'connectionCleanupErrorCode', 'privateKeyHandleCloseConfirmed',
     'recordingErrorCode', 'cacheMayBeIncomplete', 'reason',
     'droppedChunks', 'droppedBytes', 'terminalCleanupErrorCode'
   ];
