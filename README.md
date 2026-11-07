@@ -55,6 +55,18 @@ npm run build
 
 In the client configuration above, change `command` to `node` and `args` to `["D:/path/to/lite-ssh-mcp/dist/cli.js"]`. Replace the example path with the absolute path to your local build.
 
+### Development tests
+
+Run the full suite with `npm test`. To run selected compiled test files:
+
+```sh
+npm run build
+npm run build:test
+node dist-test/test/run.js dist-test/test/shell-sequence.test.js
+```
+
+The common runner prints its fixture root and passes it to every child test. Windows defaults to a new run under `<user-home>/vb-test/lite-ssh-mcp/`; other platforms use `vb-test/full-v2/portable/` in the checkout. `LSSH_TEST_ROOT` overrides the base (relative paths use the invoking working directory). Choose a dedicated, owned directory—not real SSH configuration or key folders. Tests do not repair existing parent-directory permissions. Remove only the reported run-specific fixtures after testing.
+
 ## Configure SSH logins
 
 On first startup, the server creates these files in `.lite-ssh` under the current user's home directory:

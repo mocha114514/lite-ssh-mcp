@@ -55,6 +55,18 @@ npm run build
 
 将上面客户端配置中的 `command` 改为 `node`，`args` 改为 `["D:/path/to/lite-ssh-mcp/dist/cli.js"]`，并将示例路径替换为本机构建产物的绝对路径。
 
+### 开发测试
+
+使用 `npm test` 运行完整测试。选跑已编译的测试文件：
+
+```sh
+npm run build
+npm run build:test
+node dist-test/test/run.js dist-test/test/shell-sequence.test.js
+```
+
+统一入口会打印夹具根目录，并传给所有测试子进程。Windows 默认在 `<用户主目录>/vb-test/lite-ssh-mcp/` 下创建独立运行目录；其他平台使用仓库内的 `vb-test/full-v2/portable/`。可用 `LSSH_TEST_ROOT` 覆盖根目录，相对路径按启动时的工作目录解析。请使用专用、自有的目录，不要指向真实 SSH 配置或密钥目录；测试不会修复现有父目录权限。测试结束后，仅清理输出中标明的本次运行夹具。
+
 ## 配置 SSH 连接
 
 首次启动时，服务会在当前用户主目录的 `.lite-ssh` 文件夹中创建：
