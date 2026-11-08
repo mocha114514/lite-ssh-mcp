@@ -6,13 +6,6 @@ A local MCP server that lets an AI operate remote terminals over SSH and upload 
 
 The AI calls the tools. You connect the server to your client, configure SSH logins, and describe your tasks in natural language. Terminals and file transfers are independent; transfers do not require an open terminal.
 
-## 0.2.0 highlights
-
-- Correct terminal history and character counts across erase/index controls, and prevent redraw-heavy shell initialization from stalling.
-- Apply parser-to-cache backpressure without dropping frames or increasing the hard queue budget.
-- Preserve SFTP channel ownership until physical closure, improve handshake-timeout classification and private-key cleanup reporting, and enable SSH keepalives.
-- Add isolated real Linux Bash/Zsh/Fish PTY/SSH/MCP regression tests. This does not imply macOS or arbitrary user startup configurations have been verified.
-
 ## Available tools
 
 | Tool | Purpose |
@@ -33,7 +26,7 @@ The AI calls the tools. You connect the server to your client, configure SSH log
 
 ## Install and connect
 
-Requires **Node.js 22+** and an AI client that can launch local MCP servers over stdio. This release was tested with Node.js 24.14.0 on Windows and Debian 12 (Linux). **macOS has not been verified.**
+Requires **Node.js 22+** and an AI client that can launch local MCP servers over stdio. Local use currently focuses on Windows; compatibility with other local platforms is not guaranteed.
 
 Add the server to your MCP client, adapting the configuration format to your client:
 
@@ -44,14 +37,12 @@ Add the server to your MCP client, adapting the configuration format to your cli
       "command": "npx",
       "args": [
         "-y",
-        "lite-ssh-mcp@latest"
+        "lite-ssh-mcp@0.1.0"
       ]
     }
   }
 }
 ```
-
-`@latest` follows the npm latest tag. To pin this release, use `lite-ssh-mcp@0.2.0` instead.
 
 ### Run from source
 
@@ -63,28 +54,6 @@ npm run build
 ```
 
 In the client configuration above, change `command` to `node` and `args` to `["D:/path/to/lite-ssh-mcp/dist/cli.js"]`. Replace the example path with the absolute path to your local build.
-
-### Development tests
-
-Run the full suite with `npm test`. To run selected compiled test files:
-
-```sh
-npm run build
-npm run build:test
-node dist-test/test/run.js dist-test/test/shell-sequence.test.js
-```
-
-The common runner prints its fixture root and passes it to every child test. Windows defaults to a new run under `<user-home>/vb-test/lite-ssh-mcp/`; other platforms use `vb-test/full-v2/portable/` in the checkout. `LSSH_TEST_ROOT` overrides the base (relative paths use the invoking working directory). Choose a dedicated, owned directory—not real SSH configuration or key folders. Tests do not repair existing parent-directory permissions. Remove only the reported run-specific fixtures after testing.
-
-### Real Linux shell tests (opt-in)
-
-With Bash, Zsh, Fish, and util-linux `script`/`stty` available on Linux, run after building:
-
-```sh
-LSSH_REAL_SHELLS=1 node dist-test/test/run.js dist-test/test/real-shell.test.js
-```
-
-These tests use real PTYs and shells, a temporary SSH server bound only to `127.0.0.1`, and the production MCP stdio entrypoint. Homes, configuration, history, and caches are isolated; child PIDs are recorded beneath the fixture root. They do not modify the login shell or system sshd. Without the flag they are explicitly skipped; with it, a wrong platform or missing prerequisites fails rather than silently skipping. This does not certify production OpenSSH, custom startup files, or macOS.
 
 ## Configure SSH logins
 
@@ -128,8 +97,6 @@ Replace the example IP, port, account and password. For private-key authenticati
 Omit `passphrase` if the private key is not encrypted.
 
 On the first connection or after a server host-key change, you will be prompted to verify the server's identity.
-
-Connections use SSH-level keepalives with a 30-second interval and an unanswered-probe limit of 3. These detect unresponsive connections without sending terminal input or retiring healthy idle terminals. Lost connections are not automatically reconnected, and input is never replayed.
 
 ## License
 

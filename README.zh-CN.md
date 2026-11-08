@@ -6,13 +6,6 @@
 
 AI 负责调用工具；你只需要接入服务、配置 SSH 连接，再用自然语言描述任务。终端与文件传输相互独立，不需要为传输先打开终端。
 
-## 0.2.0 更新摘要
-
-- 修正擦除、索引控制下的终端历史和字符计数，避免大量重绘阻塞 Shell 初始化。
-- 在解析器与缓存之间实施背压，不丢帧、不扩大队列硬上限。
-- SFTP 通道保持占用至实际关闭，完善握手超时分类和私钥清理报告，并启用 SSH 保活。
-- 增加隔离的真实 Linux Bash/Zsh/Fish PTY/SSH/MCP 回归测试；不代表 macOS 或任意用户启动配置已验证。
-
 ## 工具一览
 
 | 工具 | 用途 |
@@ -33,7 +26,7 @@ AI 负责调用工具；你只需要接入服务、配置 SSH 连接，再用自
 
 ## 安装与接入
 
-需要 **Node.js 22+**，以及能够启动本地 MCP（stdio）服务的 AI 客户端。本版本已使用 Node.js 24.14.0 在 Windows 和 Debian 12（Linux）上验证。**macOS 尚未实机验证。**
+需要 **Node.js 22+**，以及能够启动本地 MCP（stdio）服务的 AI 客户端。当前主要面向 Windows 本地使用，其他本地平台暂不作兼容性保证。
 
 在 MCP 客户端中添加服务，配置格式按客户端要求调整：
 
@@ -44,14 +37,12 @@ AI 负责调用工具；你只需要接入服务、配置 SSH 连接，再用自
       "command": "npx",
       "args": [
         "-y",
-        "lite-ssh-mcp@latest"
+        "lite-ssh-mcp@0.1.0"
       ]
     }
   }
 }
 ```
-
-`@latest` 跟随 npm 的 latest 标签；若需固定本次版本，可改为 `lite-ssh-mcp@0.2.0`。
 
 ### 从源码运行
 
@@ -63,28 +54,6 @@ npm run build
 ```
 
 将上面客户端配置中的 `command` 改为 `node`，`args` 改为 `["D:/path/to/lite-ssh-mcp/dist/cli.js"]`，并将示例路径替换为本机构建产物的绝对路径。
-
-### 开发测试
-
-使用 `npm test` 运行完整测试。选跑已编译的测试文件：
-
-```sh
-npm run build
-npm run build:test
-node dist-test/test/run.js dist-test/test/shell-sequence.test.js
-```
-
-统一入口会打印夹具根目录，并传给所有测试子进程。Windows 默认在 `<用户主目录>/vb-test/lite-ssh-mcp/` 下创建独立运行目录；其他平台使用仓库内的 `vb-test/full-v2/portable/`。可用 `LSSH_TEST_ROOT` 覆盖根目录，相对路径按启动时的工作目录解析。请使用专用、自有的目录，不要指向真实 SSH 配置或密钥目录；测试不会修复现有父目录权限。测试结束后，仅清理输出中标明的本次运行夹具。
-
-### 真实 Linux Shell 测试（显式启用）
-
-Linux 环境具备 Bash、Zsh、Fish 以及 util-linux 的 `script`/`stty` 后，先构建，再运行：
-
-```sh
-LSSH_REAL_SHELLS=1 node dist-test/test/run.js dist-test/test/real-shell.test.js
-```
-
-测试使用真实 PTY 和 Shell、仅监听 `127.0.0.1` 的临时 SSH 服务，以及生产 MCP stdio 入口；主目录、配置、历史和缓存均隔离，子进程 PID 记录在夹具根目录下。不修改登录 Shell 或系统 sshd。不启用时明确跳过；启用后平台错误或缺少依赖会失败，不会静默跳过。这不等同于生产 OpenSSH、自定义启动配置或 macOS 验收。
 
 ## 配置 SSH 连接
 
@@ -128,8 +97,6 @@ LSSH_REAL_SHELLS=1 node dist-test/test/run.js dist-test/test/real-shell.test.js
 未加密的私钥可以省略 `passphrase`。
 
 首次连接或服务器主机密钥变化时，会提示来源核对。
-
-连接使用 SSH 协议层保活：间隔 30 秒，允许连续 3 次探测未响应，超过阈值后断开失联连接。保活不向终端输入字符，也不会回收健康的空闲终端；连接断开后不会自动重连或重放输入。
 
 ## 许可证
 
