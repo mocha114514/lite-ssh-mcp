@@ -6,6 +6,13 @@ A local MCP server that lets an AI operate remote terminals over SSH and upload 
 
 The AI calls the tools. You connect the server to your client, configure SSH logins, and describe your tasks in natural language. Terminals and file transfers are independent; transfers do not require an open terminal.
 
+## 0.2.0 highlights
+
+- Correct terminal history and character counts across erase/index controls, and prevent redraw-heavy shell initialization from stalling.
+- Apply parser-to-cache backpressure without dropping frames or increasing the hard queue budget.
+- Preserve SFTP channel ownership until physical closure, improve handshake-timeout classification and private-key cleanup reporting, and enable SSH keepalives.
+- Add isolated real Linux Bash/Zsh/Fish PTY/SSH/MCP regression tests. This does not imply macOS or arbitrary user startup configurations have been verified.
+
 ## Available tools
 
 | Tool | Purpose |
@@ -26,7 +33,7 @@ The AI calls the tools. You connect the server to your client, configure SSH log
 
 ## Install and connect
 
-Requires **Node.js 22+** and an AI client that can launch local MCP servers over stdio. Local use currently focuses on Windows; compatibility with other local platforms is not guaranteed.
+Requires **Node.js 22+** and an AI client that can launch local MCP servers over stdio. This release was tested with Node.js 24.14.0 on Windows and Debian 12 (Linux). **macOS has not been verified.**
 
 Add the server to your MCP client, adapting the configuration format to your client:
 
@@ -43,6 +50,8 @@ Add the server to your MCP client, adapting the configuration format to your cli
   }
 }
 ```
+
+`@latest` follows the npm latest tag. To pin this release, use `lite-ssh-mcp@0.2.0` instead.
 
 ### Run from source
 
