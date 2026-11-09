@@ -1,10 +1,17 @@
 # lite-ssh-mcp
 
-[English](README.md)
+[English](README.md) · [GitHub 仓库](https://github.com/mocha114514/lite-ssh-mcp) · [问题反馈](https://github.com/mocha114514/lite-ssh-mcp/issues)
 
 让 AI 通过 SSH 操作远端终端，并通过 SFTP 上传、下载文件和目录的本地 MCP 服务。
 
 AI 负责调用工具；你只需要接入服务、配置 SSH 连接，再用自然语言描述任务。终端与文件传输相互独立，不需要为传输先打开终端。
+
+## 0.2.1 — What's new?
+
+- 修复终端历史记录重复、遗漏及字符计数不准确的问题。
+- 优化大量输出与频繁重绘时的处理，修复部分 Shell 初始化缓慢或卡住的问题。
+- 修复 SFTP 通道关闭时的资源管理问题，提高文件传输与清理的可靠性。
+- 新增 SSH 连接保活，并改进连接超时识别与资源清理异常提示。
 
 ## 工具一览
 

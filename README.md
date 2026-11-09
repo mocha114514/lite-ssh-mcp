@@ -1,10 +1,17 @@
 # lite-ssh-mcp
 
-[简体中文](README.zh-CN.md)
+[简体中文](README.zh-CN.md) · [GitHub repository](https://github.com/mocha114514/lite-ssh-mcp) · [Report an issue](https://github.com/mocha114514/lite-ssh-mcp/issues)
 
 A local MCP server that lets an AI operate remote terminals over SSH and upload or download files and directories over SFTP.
 
 The AI calls the tools. You connect the server to your client, configure SSH logins, and describe your tasks in natural language. Terminals and file transfers are independent; transfers do not require an open terminal.
+
+## 0.2.1 — What's new?
+
+- Fix duplicated or missing terminal history and inaccurate character counts.
+- Improve handling of heavy output and frequent redraws, and fix slow or stalled initialization in some shells.
+- Fix resource management during SFTP channel closure to improve file transfer and cleanup reliability.
+- Add SSH keepalives and improve connection timeout detection and cleanup error reporting.
 
 ## Available tools
 

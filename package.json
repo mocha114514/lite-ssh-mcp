@@ -3,6 +3,14 @@
   "version": "0.2.1",
   "license": "MIT",
   "description": "stdio MCP server for named SSH terminals and independent SFTP transfers",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mocha114514/lite-ssh-mcp.git"
+  },
+  "homepage": "https://github.com/mocha114514/lite-ssh-mcp",
+  "bugs": {
+    "url": "https://github.com/mocha114514/lite-ssh-mcp/issues"
+  },
   "type": "module",
   "bin": { "lite-ssh-mcp": "dist/cli.js" },
   "files": [
